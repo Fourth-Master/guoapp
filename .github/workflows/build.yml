@@ -15,10 +15,10 @@ jobs:
     timeout-minutes: 90
     strategy:
       fail-fast: false
-    matrix:
-      include:
-        - edition: zhenguojian
-          arguments: '--all-sources'
+      matrix:
+        include:
+          - edition: zhenguojian
+            arguments: '--all-sources'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
