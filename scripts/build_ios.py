@@ -118,7 +118,8 @@ def main():
         ipa = output / f'{variant.slug}-{version}-ios-unsigned.ipa'
         if ipa.exists():
             ipa.unlink()
-        run(['ditto', '-c', '-k', '--sequesterRsrc', str(payload), str(ipa)])
+        # IPA 规范要求 zip 顶层为 Payload/Runner.app，--keepParent 保留 Payload 目录名。
+        run(['ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', str(payload), str(ipa)])
         shutil.rmtree(payload)
         artifacts.append(ipa)
     if not artifacts:
