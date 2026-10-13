@@ -81,7 +81,9 @@ def main():
     flutter = shutil.which('flutter')
     if not flutter or not shutil.which('pod'):
         raise SystemExit('请安装 Flutter 和 CocoaPods。')
-    run([flutter, 'pub', 'get', '--enforce-lockfile'])
+    # pubspec.yaml 与 pubspec.lock 不同步（作者最后一次提交只改了 yaml），
+    # 与 build_android.py 一致使用普通 pub get 重新解析。
+    run([flutter, 'pub', 'get'])
     run(['pod', 'install'], cwd=root / 'ios')
     output = root / 'dist' / 'ios'
     output.mkdir(parents=True, exist_ok=True)
