@@ -92,7 +92,7 @@ class DramaCover extends StatelessWidget {
     super.key,
     required this.drama,
     required this.repository,
-    this.radius = 14,
+    this.radius = 16,
   });
   final Drama drama;
   final AppRepository repository;
@@ -149,11 +149,25 @@ class DramaCover extends StatelessWidget {
           ),
           if (drama.episodes > 0)
             Positioned(
-              left: 9,
-              bottom: 9,
-              child: Text(
-                '共 ${drama.episodes} 集',
-                style: const TextStyle(color: Colors.white, fontSize: 12),
+              left: 8,
+              bottom: 8,
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 8,
+                  vertical: 3,
+                ),
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: .55),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Text(
+                  '共 ${drama.episodes} 集',
+                  style: TextStyle(
+                    color: Colors.white.withValues(alpha: .92),
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
               ),
             ),
           if (drama.vip)
@@ -161,10 +175,21 @@ class DramaCover extends StatelessWidget {
               left: 8,
               top: 8,
               child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                 decoration: BoxDecoration(
-                  color: const Color(0xFFF6C86B),
-                  borderRadius: BorderRadius.circular(6),
+                  gradient: const LinearGradient(
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                    colors: [Color(0xFFF9D98A), Color(0xFFE9B04C)],
+                  ),
+                  borderRadius: BorderRadius.circular(8),
+                  boxShadow: [
+                    BoxShadow(
+                      color: const Color(0xFFE9B04C).withValues(alpha: .45),
+                      blurRadius: 8,
+                      offset: const Offset(0, 2),
+                    ),
+                  ],
                 ),
                 child: const Text(
                   'VIP',
@@ -172,6 +197,7 @@ class DramaCover extends StatelessWidget {
                     color: Color(0xFF40300D),
                     fontSize: 11,
                     fontWeight: FontWeight.w800,
+                    letterSpacing: .5,
                   ),
                 ),
               ),
@@ -434,8 +460,8 @@ class DramaTile extends StatelessWidget {
               maxLines: 2,
               overflow: TextOverflow.ellipsis,
               style: TextStyle(
-                fontWeight: FontWeight.w600,
-                height: 1.3,
+                fontWeight: FontWeight.w700,
+                height: 1.25,
                 fontSize: television ? 17 : 14,
               ),
             ),

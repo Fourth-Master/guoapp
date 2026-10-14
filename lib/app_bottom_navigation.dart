@@ -54,31 +54,44 @@ class AppBottomNavigation extends StatelessWidget {
                               mainAxisSize: MainAxisSize.min,
                               children: [
                                 AnimatedContainer(
-                                  duration: const Duration(milliseconds: 160),
-                                  curve: Curves.easeOut,
-                                  width: 18,
-                                  height: 3,
+                                  duration: const Duration(milliseconds: 220),
+                                  curve: Curves.easeOutCubic,
+                                  padding: EdgeInsets.symmetric(
+                                    horizontal: index == selectedIndex ? 16 : 8,
+                                  ),
+                                  height: 32,
+                                  alignment: Alignment.center,
                                   decoration: BoxDecoration(
                                     color: index == selectedIndex
-                                        ? colors.primary
+                                        ? colors.primaryContainer.withValues(
+                                            alpha: .6,
+                                          )
                                         : Colors.transparent,
-                                    borderRadius: BorderRadius.circular(1.5),
+                                    borderRadius: BorderRadius.circular(999),
+                                  ),
+                                  child: AnimatedSwitcher(
+                                    duration: const Duration(
+                                      milliseconds: 180,
+                                    ),
+                                    child: IconTheme(
+                                      key: ValueKey(
+                                        'bottom-nav-icon-$index-'
+                                        '${index == selectedIndex}',
+                                      ),
+                                      data: IconThemeData(
+                                        size: 24,
+                                        color: index == selectedIndex
+                                            ? colors.primary
+                                            : colors.onSurfaceVariant,
+                                      ),
+                                      child: index == selectedIndex
+                                          ? destination.selectedIcon ??
+                                                destination.icon
+                                          : destination.icon,
+                                    ),
                                   ),
                                 ),
-                                const SizedBox(height: 6),
-                                IconTheme(
-                                  data: IconThemeData(
-                                    size: 24,
-                                    color: index == selectedIndex
-                                        ? colors.primary
-                                        : colors.onSurfaceVariant,
-                                  ),
-                                  child: index == selectedIndex
-                                      ? destination.selectedIcon ??
-                                            destination.icon
-                                      : destination.icon,
-                                ),
-                                const SizedBox(height: 4),
+                                const SizedBox(height: 5),
                                 Text(
                                   destination.label,
                                   textAlign: TextAlign.center,
