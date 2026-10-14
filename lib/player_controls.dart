@@ -992,6 +992,77 @@ class _PlayerControlsState extends State<PlayerControls> {
     builder: (context, _) {
       final hud = widget.interactions.hudState;
       final feedback = widget.interactions.feedback;
+      if (hud.type == SwipeAction.seek) {
+        final forward = (hud.label ?? '').startsWith('快进');
+        return IgnorePointer(
+          child: Center(
+            child: Container(
+              padding: const EdgeInsets.symmetric(vertical: 18, horizontal: 22),
+              decoration: BoxDecoration(
+                color: Colors.black.withValues(alpha: .75),
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(
+                  color: Colors.white.withValues(alpha: .15),
+                  width: 1,
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: .4),
+                    blurRadius: 18,
+                    spreadRadius: 2,
+                  ),
+                ],
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    forward
+                        ? Icons.fast_forward_rounded
+                        : Icons.fast_rewind_rounded,
+                    color: Colors.white,
+                    size: 34,
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    hud.label ?? '',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 15,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 0.5,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    hud.sub ?? '',
+                    style: TextStyle(
+                      color: Colors.white.withValues(alpha: .78),
+                      fontSize: 12,
+                      fontFeatures: const [FontFeature.tabularFigures()],
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  SizedBox(
+                    width: 86,
+                    height: 4,
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(2),
+                      child: LinearProgressIndicator(
+                        value: hud.value.clamp(0.0, 1.0),
+                        backgroundColor: Colors.white24,
+                        valueColor: const AlwaysStoppedAnimation<Color>(
+                          Colors.white,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      }
       if (hud.type == SwipeAction.brightness) {
         final value = hud.value.clamp(0.0, 1.0);
         final percent = (value * 100).round();

@@ -9,15 +9,19 @@ import 'package:media_kit/media_kit.dart';
 import 'app_layout.dart';
 import 'widgets.dart';
 
-enum SwipeAction { none, brightness, episode }
+enum SwipeAction { none, brightness, episode, seek }
 
 class GestureHudState {
   const GestureHudState({
     this.type = SwipeAction.none,
     this.value = 0.0,
+    this.label,
+    this.sub,
   });
   final SwipeAction type;
   final double value; // 0.0 ~ 1.0
+  final String? label;
+  final String? sub;
 }
 
 class PlayerInteractions extends ChangeNotifier {
@@ -74,6 +78,9 @@ class PlayerInteractions extends ChangeNotifier {
   double _initialBrightness = 0.5;
   double _viewWidth = 0.0;
   double _viewHeight = 0.0;
+  Duration _seekStart = Duration.zero;
+  Duration _seekTarget = Duration.zero;
+  double _secondsPerPixel = 0.5;
   Timer? _hudTimer;
 
   GestureHudState get hudState => _hudState;
@@ -166,6 +173,7 @@ class PlayerInteractions extends ChangeNotifier {
     _origin = null;
     _lastPosition = null;
     _endHold(silent: true);
+    _scheduleDismissHud();
     hint('');
   }
 
@@ -198,7 +206,8 @@ class PlayerInteractions extends ChangeNotifier {
       if (event.localPosition.dx < width * 0.35) {
         _swipeAction = SwipeAction.brightness;
         AppDevice.getBrightness().then((val) {
-          if (_pointer == event.pointer) {
+          if (_pointer == event.pointer &&
+              _swipeAction == SwipeAction.brightness) {
             _initialBrightness = _brightness = val;
             _showHud(SwipeAction.brightness, _brightness);
           }
@@ -220,7 +229,44 @@ class PlayerInteractions extends ChangeNotifier {
     }
     if (!_swipeEnabled || !_moved || _viewHeight <= 0) return;
 
-    final dy = _origin!.dy - event.localPosition.dy; // 向上滑动为增加，向下滑动为减少
+    final dx = event.localPosition.dx - _origin!.dx;
+    final dy = _origin!.dy - event.localPosition.dy; // 向上滑动为增加，向下为减少
+
+    // 横向滑动（任意落点）：进入快进/后退预览，松手后才真正跳转。
+    if (_swipeAction != SwipeAction.seek &&
+        dx.abs() >= _swipeThreshold &&
+        dx.abs() > dy.abs() * 1.2 &&
+        player.state.duration > Duration.zero) {
+      _swipeAction = SwipeAction.seek;
+      _seekStart = player.state.position;
+      final durationSeconds = player.state.duration.inMilliseconds / 1000;
+      _secondsPerPixel = (_viewWidth > 0
+              ? durationSeconds / _viewWidth * 0.5
+              : 0.5)
+          .clamp(0.25, 3.0);
+    }
+    if (_swipeAction == SwipeAction.seek) {
+      final durationMs = player.state.duration.inMilliseconds;
+      final target = (_seekStart.inMilliseconds +
+              dx * _secondsPerPixel * 1000)
+          .round()
+          .clamp(0, durationMs)
+          .toInt();
+      _seekTarget = Duration(milliseconds: target);
+      final deltaSeconds = ((target - _seekStart.inMilliseconds) / 1000)
+          .round();
+      _showHud(
+        SwipeAction.seek,
+        durationMs > 0 ? target / durationMs : 0,
+        label: deltaSeconds >= 0
+            ? '快进 ${deltaSeconds.abs()} 秒'
+            : '后退 ${deltaSeconds.abs()} 秒',
+        sub: '${formatPosition(target / 1000)} / '
+            '${formatPosition(durationMs / 1000)}',
+      );
+      return;
+    }
+
     final deltaRatio = dy / (_viewHeight * 0.6);
 
     if (_swipeAction == SwipeAction.brightness) {
@@ -241,7 +287,18 @@ class PlayerInteractions extends ChangeNotifier {
     final delta = (_lastPosition ?? event.localPosition) - _origin!;
     final isVertical = delta.dy.abs() >= _swipeThreshold && delta.dy.abs() > delta.dx.abs() * 1.5;
 
-    if (_swipeAction == SwipeAction.episode &&
+    if (_swipeAction == SwipeAction.seek) {
+      _scheduleDismissHud();
+      if (_swipeEnabled &&
+          !_held &&
+          _moved &&
+          available() &&
+          _seekTarget != _seekStart) {
+        final seconds = (_seekTarget - _seekStart).inMilliseconds / 1000;
+        unawaited((onSeek ?? player.seek)(_seekTarget));
+        hint('${seconds >= 0 ? '已快进' : '已后退'} ${seconds.abs().round()} 秒');
+      }
+    } else if (_swipeAction == SwipeAction.episode &&
         _swipeEnabled &&
         !_held &&
         _moved &&
@@ -267,10 +324,20 @@ class PlayerInteractions extends ChangeNotifier {
     if (_pointers.isEmpty) _cancelUntilRelease = false;
   }
 
-  void _showHud(SwipeAction action, double value) {
+  void _showHud(
+    SwipeAction action,
+    double value, {
+    String? label,
+    String? sub,
+  }) {
     if (_disposed) return;
     _hudTimer?.cancel();
-    _hudState = GestureHudState(type: action, value: value);
+    _hudState = GestureHudState(
+      type: action,
+      value: value,
+      label: label,
+      sub: sub,
+    );
     notifyListeners();
   }
 
