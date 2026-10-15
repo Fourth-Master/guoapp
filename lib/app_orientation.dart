@@ -112,22 +112,6 @@ class AppOrientationController {
           ? orientations(television: true)
           : _playbackOrientations;
       if (force || !listEquals(preferred, _appliedOrientations)) {
-        final previous = _appliedOrientations;
-        final unlocking = listEquals(preferred, DeviceOrientation.values);
-        final wasLandscapeLocked =
-            previous != null &&
-            previous.length == 2 &&
-            previous.contains(DeviceOrientation.landscapeLeft) &&
-            previous.contains(DeviceOrientation.landscapeRight);
-        if (wasLandscapeLocked && unlocking) {
-          // 退出横屏全屏：先强制回竖屏再恢复自由旋转，
-          // 否则解锁后页面会停留在横屏，需要手动转回。
-          await SystemChrome.setPreferredOrientations(const [
-            DeviceOrientation.portraitUp,
-          ]);
-          await Future<void>.delayed(const Duration(milliseconds: 250));
-          if (_disposed || television != _television) return;
-        }
         await SystemChrome.setPreferredOrientations(preferred);
         if (!_disposed) _appliedOrientations = preferred;
       }

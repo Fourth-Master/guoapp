@@ -21,7 +21,6 @@ import android.net.Uri
 import android.util.Rational
 import android.view.InputDevice
 import android.view.WindowManager
-import android.provider.Settings
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 
@@ -30,6 +29,43 @@ class MainActivity : FlutterActivity() {
     private var thermalHeadroom: Double? = null
     private var deviceChannel: MethodChannel? = null
     private var televisionMode = false
+
+    // 播放页左半屏竖向拖动临时调亮度：只改本窗口 screenBrightness（-1f 表示跟随系统），
+    // 不动系统全局亮度设置，退出播放 reset 后自动恢复，无需 WRITE_SETTINGS 权限。
+    private fun effectiveScreenBrightness(): Double {
+        val local = window.attributes.screenBrightness
+        if (local >= 0f) return local.toDouble()
+        val resolver = contentResolver
+        val system = runCatching {
+            android.provider.Settings.System.getInt(
+                resolver,
+                android.provider.Settings.System.SCREEN_BRIGHTNESS
+            )
+        }.getOrNull()
+        if (system == null) return .5
+        val auto = runCatching {
+            android.provider.Settings.System.getInt(
+                resolver,
+                android.provider.Settings.System.SCREEN_BRIGHTNESS_MODE
+            )
+        }.getOrNull() == android.provider.Settings.System.SCREEN_BRIGHTNESS_MODE_AUTOMATIC
+        if (auto) {
+            val autoValue = runCatching {
+                android.provider.Settings.System.getInt(
+                    resolver,
+                    "screen_auto_brightness_adj"
+                )
+            }.getOrNull() ?: 128
+            return (autoValue.coerceIn(0, 255)) / 255.0
+        }
+        return system / 255.0
+    }
+
+    private fun applyScreenBrightness(value: Float) {
+        val attributes = window.attributes
+        attributes.screenBrightness = value.coerceIn(0.01f, 1f)
+        window.attributes = attributes
+    }
 
     @Suppress("DEPRECATION")
     private fun isTelevisionDevice(): Boolean {
@@ -157,6 +193,23 @@ class MainActivity : FlutterActivity() {
                             ))
                         }
                         "pictureInPictureStatus" -> result.success(pictureInPictureStatus())
+                        "screenBrightness" -> result.success(effectiveScreenBrightness())
+                        "setScreenBrightness" -> {
+                            val value = call.argument<Double>("value")
+                            if (value == null || value.isNaN() || value.isInfinite()) {
+                                result.error("invalid_brightness", "缺少亮度值", null)
+                            } else {
+                                applyScreenBrightness(value.toFloat())
+                                result.success(null)
+                            }
+                        }
+                        "resetScreenBrightness" -> {
+                            val attributes = window.attributes
+                            attributes.screenBrightness =
+                                WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+                            window.attributes = attributes
+                            result.success(null)
+                        }
                         "enterPictureInPicture" -> {
                             val width = call.argument<Int>("width") ?: 16
                             val height = call.argument<Int>("height") ?: 9
@@ -168,60 +221,6 @@ class MainActivity : FlutterActivity() {
                                 call.argument<Int>("right"),
                                 call.argument<Int>("bottom")
                             ))
-                        }
-                        "getBrightness" -> {
-                            val lp = window.attributes
-                            val current = if (lp.screenBrightness >= 0f) {
-                                lp.screenBrightness.toDouble()
-                            } else {
-                                try {
-                                    val sys = Settings.System.getInt(
-                                        contentResolver,
-                                        Settings.System.SCREEN_BRIGHTNESS
-                                    )
-                                    (sys / 255.0).coerceIn(0.0, 1.0)
-                                } catch (e: Exception) {
-                                    0.5
-                                }
-                            }
-                            result.success(current)
-                        }
-                        "setBrightness" -> {
-                            val value = call.argument<Double>("brightness")?.toFloat()
-                            if (value != null) {
-                                val lp = window.attributes
-                                lp.screenBrightness = value.coerceIn(0.01f, 1.0f)
-                                window.attributes = lp
-                                result.success(true)
-                            } else {
-                                result.error("invalid_arg", "缺少亮度数值", null)
-                            }
-                        }
-                        "resetBrightness" -> {
-                            val lp = window.attributes
-                            lp.screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
-                            window.attributes = lp
-                            result.success(true)
-                        }
-                        "openExternalPlayer" -> {
-                            val url = call.argument<String>("url")
-                            val title = call.argument<String>("title") ?: "短剧"
-                            if (!url.isNullOrEmpty()) {
-                                try {
-                                    val intent = Intent(Intent.ACTION_VIEW).apply {
-                                        setDataAndType(Uri.parse(url), "video/*")
-                                        putExtra("title", title)
-                                        putExtra("return_result", true)
-                                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                    }
-                                    startActivity(intent)
-                                    result.success(true)
-                                } catch (e: Exception) {
-                                    result.error("no_player", "未找到外部播放器: ${e.message}", null)
-                                }
-                            } else {
-                                result.error("invalid_url", "播放地址为空", null)
-                            }
                         }
                         else -> result.notImplemented()
                     }

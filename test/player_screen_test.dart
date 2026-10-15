@@ -3,7 +3,9 @@ import 'package:duanju_app/models.dart';
 import 'package:duanju_app/player_screen.dart';
 import 'package:duanju_app/app_layout.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -24,6 +26,7 @@ void main() {
     ScriptedPlayer platform, {
     Size? size,
     FakeViewPadding? padding,
+    ThemeData? theme,
   }) async {
     SharedPreferences.setMockInitialValues({});
     if (size != null) {
@@ -37,7 +40,7 @@ void main() {
     final detail = await repository.detail(FixtureRepository.free);
     await tester.pumpWidget(
       MaterialApp(
-        theme: ThemeData.dark(),
+        theme: theme ?? ThemeData.dark(),
         home: PlayerScreen(
           detail: detail,
           initialIndex: 0,
@@ -194,7 +197,7 @@ void main() {
     }
   });
 
-  testWidgets('mobile player pane starts below the system status area', (
+  testWidgets('mobile taps toggle controls and double taps toggle playback', (
     tester,
   ) async {
     debugDefaultTargetPlatformOverride = TargetPlatform.android;
@@ -212,6 +215,27 @@ void main() {
         find.byKey(const ValueKey('player-gesture-surface')),
       );
       expect(surface.top, greaterThanOrEqualTo(32));
+      final tapPoint = Offset(surface.center.dx, surface.top + 12);
+      expect(find.byTooltip('暂停播放'), findsOneWidget);
+      await tester.tapAt(tapPoint);
+      await tester.pump(kDoubleTapTimeout + const Duration(milliseconds: 50));
+      expect(player.state.playing, isTrue);
+      await tester.tapAt(tapPoint);
+      await tester.pump(kDoubleTapTimeout + const Duration(milliseconds: 50));
+      expect(player.state.playing, isTrue);
+
+      await tester.tapAt(tapPoint);
+      await tester.pump(kDoubleTapMinTime);
+      await tester.tapAt(tapPoint);
+      await tester.pump();
+      expect(player.state.playing, isFalse);
+
+      await tester.pump(kDoubleTapTimeout);
+      await tester.tapAt(tapPoint);
+      await tester.pump(kDoubleTapMinTime);
+      await tester.tapAt(tapPoint);
+      await tester.pump();
+      expect(player.state.playing, isTrue);
       await unmount(tester, player);
     } finally {
       debugDefaultTargetPlatformOverride = null;
@@ -239,15 +263,191 @@ void main() {
       final quality = tester.getRect(
         find.byKey(const ValueKey('player-quality')),
       );
+      final route = tester.getRect(find.byKey(const ValueKey('player-route')));
       final pip = tester.getRect(
         find.byKey(const ValueKey('player-picture-in-picture')),
       );
       expect(quality.left - speed.right, lessThan(8));
-      expect(pip.left - quality.right, lessThan(8));
+      expect(route.left - quality.right, lessThan(8));
+      expect(pip.left - route.right, lessThan(8));
       expect(pip.right, greaterThan(330));
       await unmount(tester, player);
     } finally {
       messenger.setMockMethodCallHandler(AppDevice.channel, null);
+      debugDefaultTargetPlatformOverride = null;
+    }
+  });
+
+  testWidgets('holding fast forward hides feedback and controls', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.android;
+    try {
+      final repository = RouteRepository();
+      final player = ScriptedPlayer();
+      await mount(
+        tester,
+        repository,
+        player,
+        size: const Size(390, 844),
+        theme: ThemeData.light(),
+      );
+      final surface = tester.getRect(
+        find.byKey(const ValueKey('player-gesture-surface')),
+      );
+      final target = Offset(surface.right - 20, surface.center.dy);
+      final gesture = await tester.startGesture(target);
+      await tester.pump(const Duration(milliseconds: 450));
+      await tester.pump(const Duration(milliseconds: 200));
+      expect(player.rates.last, 2);
+      expect(find.textContaining('松开恢复'), findsNothing);
+      expect(
+        tester
+            .widget<AnimatedOpacity>(
+              find.byKey(const ValueKey('player-boost-badge')),
+            )
+            .opacity,
+        1,
+      );
+      expect(
+        find.byKey(const ValueKey('player-speed')).hitTestable(),
+        findsNothing,
+      );
+      expect(
+        find.byWidgetPredicate(
+          (widget) =>
+              widget is Container &&
+              widget.decoration is BoxDecoration &&
+              (widget.decoration as BoxDecoration).color == Colors.black87,
+        ),
+        findsNothing,
+      );
+      await gesture.up();
+      await tester.pump();
+      expect(player.rates.last, 1);
+      expect(find.textContaining('恢复'), findsNothing);
+      expect(
+        tester
+            .widget<AnimatedOpacity>(
+              find.byKey(const ValueKey('player-boost-badge')),
+            )
+            .opacity,
+        0,
+      );
+      await unmount(tester, player);
+    } finally {
+      debugDefaultTargetPlatformOverride = null;
+    }
+  });
+
+  testWidgets(
+    'desktop hover and seek keep controls hidden while taps and space toggle them',
+    (tester) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+      try {
+        final repository = RouteRepository();
+        final player = ScriptedPlayer();
+        await mount(tester, repository, player, size: const Size(1280, 720));
+        final controls = find.byKey(const ValueKey('player-speed'));
+        expect(controls.hitTestable(), findsOneWidget);
+        final surface = tester.getRect(
+          find.byKey(const ValueKey('player-gesture-surface')),
+        );
+        final tapPoint = Offset(surface.center.dx, surface.top + 12);
+        await tester.pump(const Duration(seconds: 5));
+        expect(controls.hitTestable(), findsNothing);
+
+        final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+        await mouse.addPointer(location: tapPoint);
+        await mouse.moveTo(Offset(surface.center.dx, surface.center.dy));
+        await tester.pump();
+        expect(controls.hitTestable(), findsNothing);
+
+        await mouse.moveTo(Offset(surface.center.dx, surface.bottom - 8));
+        await tester.pump();
+        expect(controls.hitTestable(), findsOneWidget);
+
+        await tester.tapAt(tapPoint);
+        await tester.pump();
+        expect(controls.hitTestable(), findsNothing);
+        await tester.tapAt(tapPoint);
+        await tester.pump();
+        expect(controls.hitTestable(), findsOneWidget);
+
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.space);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.space);
+        await tester.pump();
+        expect(player.state.playing, isFalse);
+        expect(controls.hitTestable(), findsOneWidget);
+
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.space);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.space);
+        await tester.pump();
+        expect(player.state.playing, isTrue);
+        expect(controls.hitTestable(), findsNothing);
+
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.arrowLeft);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.arrowLeft);
+        await tester.pump();
+        expect(find.textContaining('后退至'), findsNothing);
+        expect(controls.hitTestable(), findsNothing);
+
+        await mouse.removePointer();
+        await unmount(tester, player);
+      } finally {
+        debugDefaultTargetPlatformOverride = null;
+      }
+    },
+  );
+
+  testWidgets('manual route selection is reused by the next episode', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    try {
+      final repository = RouteRepository();
+      final player = ScriptedPlayer();
+      await mount(tester, repository, player, size: const Size(1280, 720));
+      expect(find.byKey(const ValueKey('player-route')), findsOneWidget);
+      expect(find.text('线路 1'), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('player-route')));
+      await tester.pumpAndSettle();
+      expect(find.text('播放线路'), findsWidgets);
+      await tester.tap(find.byKey(const ValueKey('menu-route-1')));
+      await tester.pumpAndSettle();
+      expect(repository.routeCalls, 1);
+      expect(repository.requestedRoutes.last, 1);
+      expect(find.text('线路 2'), findsOneWidget);
+      expect(player.state.playing, isTrue);
+      await tester.tap(find.byTooltip('下一集'));
+      await settleOperations(tester);
+      expect(repository.requestedEpisodes.last, 2);
+      expect(repository.requestedRoutes.last, 1);
+      expect(find.text('线路 2'), findsOneWidget);
+      await unmount(tester, player);
+      expect(repository.active, isEmpty);
+    } finally {
+      debugDefaultTargetPlatformOverride = null;
+    }
+  });
+
+  testWidgets('switching episodes keeps the control overlay hidden', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    try {
+      final repository = RouteRepository();
+      final player = ScriptedPlayer();
+      await mount(tester, repository, player, size: const Size(1280, 720));
+      final controls = find.byKey(const ValueKey('player-speed'));
+      expect(controls.hitTestable(), findsOneWidget);
+      await tester.tap(find.byTooltip('下一集'));
+      await settleOperations(tester);
+      expect(repository.requestedEpisodes.last, 2);
+      expect(player.state.playing, isTrue);
+      expect(controls.hitTestable(), findsNothing);
+      await unmount(tester, player);
+    } finally {
       debugDefaultTargetPlatformOverride = null;
     }
   });

@@ -7,9 +7,8 @@ import 'episode_browser.dart';
 import 'playback_preferences.dart';
 import 'video_enhancement.dart';
 import 'video_enhancement_settings.dart';
-import 'diary_service.dart';
 
-enum PlayerMenuSection { episodes, speed, quality, settings }
+enum PlayerMenuSection { episodes, speed, quality, route, settings }
 
 class PlayerMenu extends StatefulWidget {
   const PlayerMenu({
@@ -26,6 +25,9 @@ class PlayerMenu extends StatefulWidget {
     required this.onEpisode,
     required this.onPreferences,
     required this.onFavorite,
+    this.routeIndex = 0,
+    this.routeCount = 1,
+    this.onRoute,
     this.showDanmaku = false,
     this.danmakuStatus = '',
     this.onRetryDanmaku,
@@ -43,6 +45,9 @@ class PlayerMenu extends StatefulWidget {
   final bool local;
   final bool favorite;
   final bool mobile;
+  final int routeIndex;
+  final int routeCount;
+  final ValueChanged<int>? onRoute;
   final bool showDanmaku;
   final String danmakuStatus;
   final VoidCallback? onRetryDanmaku;
@@ -85,6 +90,7 @@ class _PlayerMenuState extends State<PlayerMenu> {
       PlayerMenuSection.episodes => '选集 · 共 ${widget.episodes.length} 集',
       PlayerMenuSection.speed => '播放倍速',
       PlayerMenuSection.quality => '清晰度',
+      PlayerMenuSection.route => '播放线路',
       PlayerMenuSection.settings => '播放设置',
     };
     return Dialog(
@@ -227,6 +233,33 @@ class _PlayerMenuState extends State<PlayerMenu> {
             ),
           const SizedBox(height: 20),
         ],
+        if (widget.section == PlayerMenuSection.route) ...[
+          const Text('播放线路'),
+          const SizedBox(height: 8),
+          Text(
+            widget.routeCount > 1
+                ? '当前使用线路 ${widget.routeIndex + 1}，共 ${widget.routeCount} 条。切换线路后会保留当前进度，并在后续剧集继续使用该线路。'
+                : '本集只有一条可用线路，无法切换。',
+            style: helperStyle,
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              for (var index = 0; index < widget.routeCount; index++)
+                ChoiceChip(
+                  key: ValueKey('menu-route-$index'),
+                  label: Text('线路 ${index + 1}'),
+                  selected: index == widget.routeIndex,
+                  onSelected: widget.onRoute == null
+                      ? null
+                      : (_) => widget.onRoute!(index),
+                ),
+            ],
+          ),
+          const SizedBox(height: 20),
+        ],
         if ((all || widget.section == PlayerMenuSection.quality) &&
             widget.enhancement != null)
           VideoEnhancementSettings(
@@ -264,6 +297,21 @@ class _PlayerMenuState extends State<PlayerMenu> {
           const SizedBox(height: 8),
         ],
         if (all) ...[
+          SwitchListTile.adaptive(
+            key: const ValueKey('player-adblock-enabled'),
+            contentPadding: EdgeInsets.zero,
+            title: const Text('去广告'),
+            subtitle: const Text('播放前清洗 m3u8，剔除插播在时间线里的广告分片；关闭后加载原画'),
+            value: preferences.adBlock,
+            onChanged: _busy
+                ? null
+                : (value) => _run(
+                    () => widget.onPreferences(
+                      preferences.copyWith(adBlock: value),
+                    ),
+                  ),
+          ),
+          const SizedBox(height: 8),
           SwitchListTile.adaptive(
             key: const ValueKey('player-preload-enabled'),
             contentPadding: EdgeInsets.zero,
@@ -304,18 +352,11 @@ class _PlayerMenuState extends State<PlayerMenu> {
             ),
             label: Text(widget.favorite ? '取消追剧' : '加入追剧'),
           ),
-          const SizedBox(height: 12),
-          OutlinedButton.icon(
-            key: const ValueKey('player-diary-btn'),
-            onPressed: () => DiaryService.showDiaryDialog(context),
-            icon: const Icon(Icons.receipt_long_rounded),
-            label: const Text('查看播放调试日记'),
-          ),
           const SizedBox(height: 20),
           Text(
             widget.mobile
-                ? '上下滑切集；长按画面临时 3 倍速，松开恢复。竖屏轻点暂停，横屏轻点显示控制；双击播放或暂停。'
-                : '空格：播放 / 暂停\n左右键：后退 / 快进 5 秒\n长按右键或画面：临时 3 倍速\n上下键：音量 ±5%，M：静音\nF、F11、Ctrl+F：全屏\nEsc：先关闭菜单，再退出全屏',
+                ? '上下滑切集；长按画面临时 2 倍速，松开恢复。竖屏轻点暂停，横屏轻点显示控制；双击播放或暂停。'
+                : '空格：播放 / 暂停\n左右键：后退 / 快进 5 秒\n长按右键或画面：临时 2 倍速\n上下键：音量 ±5%，M：静音\nF、F11、Ctrl+F：全屏\nEsc：先关闭菜单，再退出全屏',
             style: helperStyle.copyWith(height: 1.6),
           ),
         ],

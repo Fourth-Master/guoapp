@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:duanju_app/local_profiles.dart';
+import 'package:duanju_app/local_store.dart';
 import 'package:duanju_app/models.dart';
 import 'package:duanju_app/source_status.dart';
 import 'package:duanju_app/sources_screen.dart';
@@ -62,6 +63,49 @@ class SourceFixtureRepository extends FixtureRepository {
 }
 
 void main() {
+  test(
+    'eleven short-drama sources are registered and paged search is scoped',
+    () {
+      const expected = {
+        'yaguo',
+        'maoguo',
+        'fanguo',
+        'guanguo',
+        'heguo',
+        'xingguo',
+        'huaguo',
+        'niuguo',
+        'wangguo',
+        'faguo',
+        'wuguo',
+      };
+      final actual = SourceSite.duanjuValues.map((source) => source.id).toSet();
+      expect(actual, expected);
+      expect(
+        SourceSite.knownValues.map((source) => source.id).toSet(),
+        containsAll(expected),
+      );
+      for (final source in SourceSite.duanjuValues) {
+        expect(SourceSite.isKnown(source.id), isTrue);
+        expect(source.onlineSearch, isTrue);
+      }
+      expect(
+        SourceSite.duanjuValues
+            .where((source) => source.pagedSearch)
+            .map((source) => source.id),
+        containsAll({
+          'yaguo',
+          'guanguo',
+          'huaguo',
+          'niuguo',
+          'wangguo',
+          'faguo',
+          'wuguo',
+        }),
+      );
+    },
+  );
+
   testWidgets('source list keeps bottom content above system navigation', (
     tester,
   ) async {
@@ -70,7 +114,7 @@ void main() {
     tester.view.padding = const FakeViewPadding(bottom: 34);
     addTearDown(tester.view.reset);
     SharedPreferences.setMockInitialValues({});
-    final store = testStore(await SharedPreferences.getInstance());
+    final store = LocalStore(await SharedPreferences.getInstance());
     await tester.pumpWidget(
       MaterialApp(
         home: SourcesScreen(
@@ -90,9 +134,7 @@ void main() {
     'source update prevents duplicate submits and can stop without losing cache',
     (tester) async {
       SharedPreferences.setMockInitialValues({});
-      final store = testStore(await SharedPreferences.getInstance());
-      // 管理员默认可见全部站源；显式启用密码锁以覆盖解锁后的站源范围。
-      await store.enableSourceGate('666666');
+      final store = LocalStore(await SharedPreferences.getInstance());
       final repository = SourceFixtureRepository()
         ..pending = Completer<SourceStatus>();
       await tester.pumpWidget(
@@ -141,7 +183,7 @@ void main() {
         ]),
         'activeProfile': 'viewer',
       });
-      final store = testStore(await SharedPreferences.getInstance());
+      final store = LocalStore(await SharedPreferences.getInstance());
       final repository = SourceFixtureRepository();
       await tester.pumpWidget(
         MaterialApp(
@@ -164,7 +206,7 @@ void main() {
       'source diagnostics remain collapsed through $operation polling and completion',
       (tester) async {
         SharedPreferences.setMockInitialValues({});
-        final store = testStore(await SharedPreferences.getInstance());
+        final store = LocalStore(await SharedPreferences.getInstance());
         SourceStatus status(String state, {bool running = false}) =>
             SourceStatus.fromJson({
               'source': 'hongguo',
@@ -267,7 +309,7 @@ void main() {
       addTearDown(tester.view.resetPhysicalSize);
       addTearDown(tester.view.resetDevicePixelRatio);
       SharedPreferences.setMockInitialValues({});
-      final store = testStore(await SharedPreferences.getInstance());
+      final store = LocalStore(await SharedPreferences.getInstance());
       final repository = SourceFixtureRepository();
       repository.statuses['hongguo'] = SourceStatus.fromJson({
         'source': 'hongguo',

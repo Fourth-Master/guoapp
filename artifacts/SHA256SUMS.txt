@@ -1,2 +1,0 @@
-cf9d2985765caa83d67873b3d658f6554be616b8043bbe8a9ae6e7031ea3b590  zhenguojian-0.2.64+71-ios-unsigned-app.zip
-d5b795caf7a9ae8df245a0825e55356f200f71523b6c88ca3670766db78dab17  zhenguojian-0.2.64+71-ios-unsigned.ipa

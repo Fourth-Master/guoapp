@@ -48,6 +48,13 @@ Future<void> flushDanmaku() async {
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  test('danmaku text truncation does not split joined emoji sequences', () {
+    expect(trimDanmakuText('abc👨‍👩‍👧z', 6), 'abc');
+    expect(trimDanmakuText('abc❤️z', 4), 'abc');
+    expect(trimDanmakuText('plain text', 5), 'plain');
+    expect(trimDanmakuText('short', 10), 'short');
+  });
+
   test(
     'danmaku keeps zero timestamps and text while rejecting unverified items and windows',
     () {
@@ -229,6 +236,30 @@ void main() {
       await flushDanmaku();
       controller.endSeek(const Duration(seconds: 65));
       expect(repository.danmakuCalls.last.startMs, 60000);
+    },
+  );
+
+  test(
+    'position updates refresh moving overlays at most four times per second',
+    () async {
+      var now = DateTime(2026);
+      final repository = DanmakuFixtureRepository();
+      final controller = DanmakuController(repository, now: () => now)
+        ..setPlan(danmakuPlan);
+      addTearDown(controller.dispose);
+      var notifications = 0;
+      controller.addListener(() => notifications++);
+      updateDanmaku(controller);
+      await flushDanmaku();
+      final baseline = notifications;
+      for (final milliseconds in [50, 100, 150, 200]) {
+        now = DateTime(2026).add(Duration(milliseconds: milliseconds));
+        updateDanmaku(controller, position: milliseconds);
+      }
+      expect(notifications, baseline);
+      now = DateTime(2026).add(const Duration(milliseconds: 300));
+      updateDanmaku(controller, position: 300);
+      expect(notifications, baseline + 1);
     },
   );
 

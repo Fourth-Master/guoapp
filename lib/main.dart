@@ -20,11 +20,9 @@ import 'package_smoke.dart';
 import 'lan_controller.dart';
 import 'player_screen.dart';
 import 'video_enhancement_assets.dart';
-import 'diary_service.dart';
 
 Future<void> main(List<String> arguments) async {
   WidgetsFlutterBinding.ensureInitialized();
-  DiaryService.add('[App] 应用启动，版本: 0.2.64+71, 平台: ${Platform.operatingSystem}');
   if (Platform.isAndroid) {
     await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     SystemChrome.setSystemUIOverlayStyle(AppTheme.systemBars(Brightness.dark));
@@ -223,8 +221,8 @@ class DuanjuApp extends StatelessWidget {
     locale: const Locale('zh', 'CN'),
     supportedLocales: const [Locale('zh', 'CN')],
     localizationsDelegates: GlobalMaterialLocalizations.delegates,
-    theme: AppTheme.light,
-    darkTheme: AppTheme.dark,
+    theme: AppTheme.platformLight,
+    darkTheme: AppTheme.platformDark,
     themeMode: AppTheme.mode(store?.themeMode ?? 'system'),
     builder: (context, child) {
       final mode = store?.displayMode ?? 'auto';
@@ -240,7 +238,13 @@ class DuanjuApp extends StatelessWidget {
               television: tv,
               version: version,
               child: Theme(
-                data: tv ? televisionTheme(theme) : theme,
+                data: tv
+                    ? televisionTheme(
+                        theme.brightness == Brightness.dark
+                            ? AppTheme.dark
+                            : AppTheme.light,
+                      )
+                    : theme,
                 child: Shortcuts(
                   shortcuts: const {
                     SingleActivator(
@@ -291,7 +295,7 @@ class DuanjuApp extends StatelessWidget {
                     ),
                     const SizedBox(height: 24),
                     if (bootstrapError == null)
-                      const CircularProgressIndicator()
+                      const CircularProgressIndicator.adaptive()
                     else
                       FilledButton(
                         onPressed: onRetry,

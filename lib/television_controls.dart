@@ -11,7 +11,6 @@ import 'video_enhancement_preferences.dart';
 import 'video_enhancement_settings.dart';
 import 'remote_widgets.dart';
 import 'widgets.dart';
-import 'diary_service.dart';
 
 class TelevisionControls extends StatefulWidget {
   const TelevisionControls({
@@ -50,7 +49,6 @@ class _TelevisionControlsState extends State<TelevisionControls> {
   final _surface = FocusNode(debugLabel: 'tv-player-surface');
   final _play = FocusNode(debugLabel: 'tv-player-play');
   final _episodes = FocusNode(debugLabel: 'tv-player-episodes');
-  final _diary = FocusNode(debugLabel: 'tv-player-diary');
   final _settings = FocusNode(debugLabel: 'tv-player-settings');
   final _progress = FocusNode(debugLabel: 'tv-player-progress');
   final _subscriptions = <StreamSubscription<dynamic>>[];
@@ -236,7 +234,7 @@ class _TelevisionControlsState extends State<TelevisionControls> {
     for (final subscription in _subscriptions) {
       subscription.cancel();
     }
-    for (final node in [_surface, _play, _episodes, _diary, _settings, _progress]) {
+    for (final node in [_surface, _play, _episodes, _settings, _progress]) {
       node.dispose();
     }
     super.dispose();
@@ -410,22 +408,6 @@ class _TelevisionControlsState extends State<TelevisionControls> {
                               onPressed: () =>
                                   _openPanel(widget.onEpisodes, _episodes),
                             ),
-                            RemoteButton(
-                              key: const ValueKey('tv-diary'),
-                              label: '播放日记',
-                              icon: Icons.receipt_long_rounded,
-                              focusNode: _diary,
-                              onPressed: () async {
-                                _hideTimer?.cancel();
-                                setState(() => _panelOpen = true);
-                                await DiaryService.showDiaryDialog(context);
-                                if (mounted) {
-                                  setState(() => _panelOpen = false);
-                                  _focus(_diary);
-                                  _scheduleHide();
-                                }
-                              },
-                            ),
                             if (widget.enhancement != null)
                               AnimatedBuilder(
                                 animation: widget.enhancement!,
@@ -530,6 +512,7 @@ class TelevisionPlaybackSetting {
     this.danmaku,
     this.preload,
     this.enhancement,
+    this.route,
   });
   final double? speed;
   final int? quality;
@@ -537,6 +520,7 @@ class TelevisionPlaybackSetting {
   final bool? danmaku;
   final bool? preload;
   final VideoEnhancementPreferences? enhancement;
+  final int? route;
 }
 
 class TelevisionSettingsDialog extends StatelessWidget {
@@ -556,6 +540,8 @@ class TelevisionSettingsDialog extends StatelessWidget {
     this.preloadStatus = '',
     this.enhancement,
     this.onCompareEnhancement,
+    this.route = 0,
+    this.routeCount = 1,
   });
   final double speed;
   final int quality;
@@ -571,6 +557,8 @@ class TelevisionSettingsDialog extends StatelessWidget {
   final String preloadStatus;
   final VideoEnhancementController? enhancement;
   final VoidCallback? onCompareEnhancement;
+  final int route;
+  final int routeCount;
 
   @override
   Widget build(BuildContext context) => AlertDialog(
@@ -623,6 +611,27 @@ class TelevisionSettingsDialog extends StatelessWidget {
                   ),
               ],
             ),
+            if (routeCount > 1) ...[
+              const SizedBox(height: 20),
+              const Text('播放线路', style: TextStyle(fontSize: 18)),
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  for (var index = 0; index < routeCount; index++)
+                    RemoteButton(
+                      key: ValueKey('tv-route-$index'),
+                      label: '线路 ${index + 1}',
+                      selected: index == route,
+                      onPressed: () => Navigator.pop(
+                        context,
+                        TelevisionPlaybackSetting(route: index),
+                      ),
+                    ),
+                ],
+              ),
+            ],
             const SizedBox(height: 20),
             if (enhancement != null)
               VideoEnhancementSettings(

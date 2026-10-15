@@ -16,16 +16,11 @@ import 'lan_sync_models.dart';
 part 'local_store_sync.dart';
 
 class LocalStore extends ChangeNotifier {
-  /// [pinHasher] 可注入，便于测试替换掉默认的 isolate 哈希实现。
-  LocalStore(
-    this.preferences, {
-    Future<String> Function(String, String)? pinHasher,
-  }) : _pinHasher = pinHasher ?? hashProfilePin {
+  LocalStore(this.preferences) {
     _initialize();
   }
 
   final SharedPreferences preferences;
-  final Future<String> Function(String pin, String salt) _pinHasher;
   LocalSnapshot? _snapshot;
   LanDocument? _lanDocumentCache;
   int _lanRevision = 0;
@@ -44,16 +39,15 @@ class LocalStore extends ChangeNotifier {
   String? _configurationError;
   int _epoch = 0;
   int _failures = 0;
-  bool _sourcesUnlocked = false;
-  bool _gateEnabled = false;
-  bool _gateOff = false;
-  String _gateSalt = '';
-  String _gateHash = '';
   DateTime _retryAfter = DateTime(2000);
+  List<CustomSourceSite> _customSources = [];
 
   void _initialize() {
     try {
       _snapshot = LocalSnapshot(preferences);
+      // 先恢复自定义源：用户档案里可能勾选了自定义源，读取档案时
+      // SourceSite.customIds 必须已经就绪，否则档案会被判为无效。
+      _loadCustomSources();
       final raw = _snapshot!.getString('profiles');
       if (raw == null &&
           (_snapshot!.getString('activeProfile') != null ||
@@ -71,7 +65,6 @@ class LocalStore extends ChangeNotifier {
       }
       _configurationError = null;
       _locked = forceLogin && profile.protected;
-      _loadSourceGate();
       _loadLibrary();
     } catch (_) {
       _block('本地用户配置损坏，已锁定访问。原始记录已保留，请重新读取或从备份恢复。');
@@ -99,7 +92,6 @@ class LocalStore extends ChangeNotifier {
   void _block(String message) {
     _configurationError = message;
     _locked = true;
-    _sourcesUnlocked = false;
     _profiles = [
       const LocalProfile(id: 'default', name: '配置待恢复', download: false),
     ];
@@ -132,120 +124,104 @@ class LocalStore extends ChangeNotifier {
   }
 
   bool get canDownload => !locked && (profile.admin || profile.download);
-  bool allowsSource(String source) =>
-      !locked &&
-      SourceSite.isAvailable(source) &&
-      profile.allows(source) &&
-      (_gateOff || _sourcesUnlocked || SourceSite.isPrimary(source));
-  List<SourceSite> get sources => SourceSite.visibleValues(
-    unlocked: _gateOff || _sourcesUnlocked,
-  ).where((site) => allowsSource(site.id)).toList();
-
-  /// 默认隐藏的站源是否已解锁。解锁状态只在本次运行内有效，重启后恢复隐藏。
-  bool get sourcesUnlocked => _gateOff || _sourcesUnlocked;
-
-  /// 是否已启用站源密码锁。
-  bool get sourceGateEnabled => _gateEnabled;
-
-  bool get sourceGateConfigured => _gateSalt.isNotEmpty && _gateHash.isNotEmpty;
-
-  /// 当前是否处于「不使用密码、显示全部站源」状态。
-  bool get sourceGateOff => _gateOff;
-
-  void _loadSourceGate() {
-    final enabled = _bool('sourceGateEnabled') ?? false;
-    final off = _bool('sourceGateOff') ?? false;
-    final salt = _string('sourceGateSalt') ?? '';
-    final hash = _string('sourceGateHash') ?? '';
-    final valid =
-        enabled &&
-        RegExp(r'^[a-f0-9]{32}$').hasMatch(salt) &&
-        RegExp(r'^[a-f0-9]{64}$').hasMatch(hash);
-    _gateEnabled = valid;
-    _gateOff = !valid && off;
-    _gateSalt = valid ? salt : '';
-    _gateHash = valid ? hash : '';
-    _sourcesUnlocked = false;
+  bool allowsSource(String source) {
+  if (locked) return false;
+  if (!SourceSite.isAvailable(source)) return false;
+  // 自定义源为设备级功能，管理员与普通用户均可使用。
+  if (SourceSite.isCustomId(source)) return true;
+  return profile.allows(source);
+}
+  List<SourceSite> get sources {
+    final builtIn = SourceSite.values.where((site) => allowsSource(site.id));
+    final custom = _customSources
+        .where((site) => allowsSource(site.id))
+        .map((site) => site.asSourceSite);
+    return [...builtIn, ...custom];
   }
 
-  Future<void> _checkSourcePin(String pin) async {
-    if (DateTime.now().isBefore(_retryAfter)) {
-      throw StateError('密码输入过于频繁，请稍后再试');
+  /// 当前用户被隐藏、不首页显示的站源 id 集合（含内置与自定义站源）。
+  Set<String> get hiddenSites {
+    if (locked) return const {};
+    try {
+      return (jsonDecode(_string(_key('hiddenSites')) ?? '[]') as List)
+          .whereType<String>()
+          .toSet();
+    } catch (_) {
+      return const {};
     }
-    final actual = await _pinHasher(pin, _gateSalt);
-    var difference = actual.length ^ _gateHash.length;
-    for (var i = 0; i < actual.length && i < _gateHash.length; i++) {
-      difference |= actual.codeUnitAt(i) ^ _gateHash.codeUnitAt(i);
-    }
-    if (difference != 0) {
-      _failures++;
-      if (_failures >= 3) {
-        _retryAfter = DateTime.now().add(
-          Duration(seconds: (_failures * 2).clamp(0, 30)),
-        );
+  }
+
+  bool siteVisible(String source) => !hiddenSites.contains(source);
+
+  /// 首页与各站源分组消费的可见站源列表。
+  List<SourceSite> get visibleSources {
+    final hidden = hiddenSites;
+    return sources.where((site) => !hidden.contains(site.id)).toList();
+  }
+
+  Future<void> setSiteVisible(String source, bool visible) {
+    final epoch = _epoch;
+    return _queue(() async {
+      if (locked || epoch != _epoch) return;
+      if (!SourceSite.isKnown(source)) {
+        throw StateError('未知站源');
       }
-      throw StateError('密码不正确');
-    }
-    _failures = 0;
-  }
-
-  /// 校验密码并解锁默认隐藏的站源（仅本次运行有效）。
-  Future<void> unlockSources(String pin) => _queue(() async {
-    if (_configurationError != null) throw StateError('本地用户配置损坏，请先恢复');
-    if (!_gateEnabled) throw StateError('尚未启用站源密码锁');
-    await _checkSourcePin(pin);
-    if (!_sourcesUnlocked) {
-      _sourcesUnlocked = true;
+      final next = Set<String>.of(hiddenSites);
+      if (visible) {
+        next.remove(source);
+      } else {
+        next.add(source);
+      }
+      await _commit({_key('hiddenSites'): jsonEncode(next.toList())});
       _notify();
-    }
-  });
+    });
+  }
+  List<CustomSourceSite> get customSources => List.unmodifiable(_customSources);
 
-  /// 重新隐藏默认隐藏的站源，无需重启。
-  void lockSources() {
-    if (!_gateEnabled || !_sourcesUnlocked) return;
-    _sourcesUnlocked = false;
-    _notify();
+  void _loadCustomSources() {
+    try {
+      _customSources = [
+        for (final row in readJsonList(_string('customSources')))
+          CustomSourceSite.fromJson(row),
+      ];
+    } catch (_) {
+      _customSources = [];
+    }
+    _syncCustomIds();
   }
 
-  /// 设置或更换密码锁，并立即解锁。
-  Future<void> enableSourceGate(String pin) => _queue(() async {
-    _requireAdmin();
-    final value = pin.trim();
-    if (!RegExp(r'^\d{3,12}$').hasMatch(value)) {
-      throw StateError('密码需要 3 至 12 位数字');
-    }
-    final salt = randomProfileToken();
-    final hash = await _pinHasher(value, salt);
-    await _commit({
-      'sourceGateEnabled': true,
-      'sourceGateOff': false,
-      'sourceGateSalt': salt,
-      'sourceGateHash': hash,
-    });
-    _gateEnabled = true;
-    _gateOff = false;
-    _gateSalt = salt;
-    _gateHash = hash;
-    _sourcesUnlocked = true;
-    _notify();
-  });
+  void _syncCustomIds() {
+    SourceSite.customIds
+      ..clear()
+      ..addAll(_customSources.map((site) => site.id));
+  }
 
-  /// 关闭密码功能，恢复全部站源可见。
-  Future<void> disableSourceGate() => _queue(() async {
-    _requireAdmin();
-    await _commit({
-      'sourceGateEnabled': false,
-      'sourceGateOff': true,
-      'sourceGateSalt': '',
-      'sourceGateHash': '',
+  /// 将设备端已保存的自定义源替换为最新结果并持久化。
+  Future<void> syncCustomSources(List<CustomSourceSite> sources) async {
+    final epoch = _epoch;
+    await _queue(() async {
+      if (locked || epoch != _epoch) return;
+      final sorted = List<CustomSourceSite>.of(sources)..sort((a, b) {
+        final la = a.name.toLowerCase(), lb = b.name.toLowerCase();
+        return la.compareTo(lb);
+      });
+      final serialized = jsonEncode(sorted.map((site) => site.toJson()).toList());
+      if (serialized == _string('customSources')) {
+        _customSources = sorted;
+        _syncCustomIds();
+        return;
+      }
+      await _commit({
+        'customSources': serialized,
+      });
+      _customSources = sorted;
+      _syncCustomIds();
+      _notify();
     });
-    _gateEnabled = false;
-    _gateOff = true;
-    _gateSalt = '';
-    _gateHash = '';
-    _sourcesUnlocked = false;
-    _notify();
-  });
+  }
+
+  Future<void> persistCustomSources(List<CustomSourceSite> sources) =>
+      syncCustomSources(sources);
 
   void _loadLibrary() {
     _lanDocumentCache = null;
@@ -372,10 +348,12 @@ class LocalStore extends ChangeNotifier {
   bool get exportPosters => !locked && (_bool('exportPosters') ?? false);
   String get source {
     if (locked) return '';
+    final visible = visibleSources;
     final value = _string(_key('source')) ?? '';
-    return sources.any((site) => site.id == value)
+    // 首页默认站源只在可见站源中选择；站源被隐藏后自动落到下一个可见源。
+    return visible.any((site) => site.id == value)
         ? value
-        : sources.firstOrNull?.id ?? '';
+        : visible.firstOrNull?.id ?? sources.firstOrNull?.id ?? '';
   }
 
   DownloadPreferences get downloadPreferences {
@@ -932,7 +910,7 @@ class LocalStore extends ChangeNotifier {
           throw StateError('密码需要 6 至 128 个字符');
         }
         salt = randomProfileToken();
-        hash = await _pinHasher(pin, salt);
+        hash = await hashProfilePin(pin, salt);
       }
     }
     _requireAdmin();
@@ -1006,6 +984,9 @@ class LocalStore extends ChangeNotifier {
               _string(_key('mediaHistory', profile.id)) ?? '{}',
             ),
             'source': _string(_key('source', profile.id)) ?? '',
+            'hiddenSites': jsonDecode(
+              _string(_key('hiddenSites', profile.id)) ?? '[]',
+            ),
             'hideVip': _bool(_key('hideVip', profile.id)) ?? true,
             'playback': jsonDecode(
               _string(_key('playback', profile.id)) ?? '{}',
@@ -1082,6 +1063,10 @@ class LocalStore extends ChangeNotifier {
       if (library['hideVip'] is! bool || library['source'] is! String) {
         throw const FormatException('备份设置无效');
       }
+      if (library.containsKey('hiddenSites') &&
+          library['hiddenSites'] is! List) {
+        throw const FormatException('备份站源显示设置无效');
+      }
       PlaybackPreferences.fromJson(
         Map<String, dynamic>.from(library['playback'] as Map? ?? {}),
       );
@@ -1141,6 +1126,9 @@ class LocalStore extends ChangeNotifier {
           library['mediaHistory'] ?? {},
         ),
         _key('source', profile.id): library['source'] as String,
+        _key('hiddenSites', profile.id): jsonEncode(
+          (library['hiddenSites'] as List? ?? []).whereType<String>().toList(),
+        ),
         _key('hideVip', profile.id): library['hideVip'] as bool,
         _key('playback', profile.id): jsonEncode(library['playback'] ?? {}),
         _key('downloadPreferences', profile.id): jsonEncode(
@@ -1159,7 +1147,6 @@ class LocalStore extends ChangeNotifier {
     _current = profiles.firstWhere((profile) => profile.admin).id;
     _configurationError = null;
     _locked = forceLogin && profile.protected;
-    _loadSourceGate();
     _loadLibrary();
     _epoch++;
     _notify();

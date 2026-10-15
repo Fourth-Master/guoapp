@@ -36,8 +36,13 @@ func validNativeCategory(source, category string) bool {
 	if category == "" {
 		return true
 	}
-	if len(category) > 128 || strings.ContainsAny(category, "|/\\\x00\r\n") {
+	if len(category) > 128 || strings.ContainsAny(category, "|\\\x00\r\n") {
 		return false
+	}
+	if isCustomMaccmsSource(source) {
+		// 自定义 MacCMS 源的分类 ID 允许是路径形式（/fenlei/1、/listnews/2 等），
+		// 上面已排除缓存键分隔符 |、反斜杠与控制字符，这里直接放行。
+		return true
 	}
 	switch source {
 	case sourceHongguo:
@@ -63,12 +68,17 @@ func validNativeCategory(source, category string) bool {
 		return validYeguoCategory(category)
 	case sourceDSD:
 		return webProviderNumericID.MatchString(category)
-	case sourceSorani:
-		return validSoraniCategory(category)
 	case sourceGuipian:
 		return validGuipianCategory(category)
 	case sourceHanxiaoquan:
 		return validHanxiaoquanCategory(category)
+	case sourceIkanbot:
+		return validIkanbotCategory(category)
+	case sourceA123:
+		return validA123Category(category)
+	}
+	if isDuanjuProviderSource(source) {
+		return validDuanjuCategory(source, category)
 	}
 	return false
 }
@@ -86,6 +96,21 @@ func (engine *nativeEngine) nativeCategories(ctx context.Context, source string,
 		return append(all, nativeAICategories...), nil
 	case sourceHuangdou:
 		return all, nil
+	}
+	if isCustomMaccmsSource(source) {
+		// 自定义 maccms 站点：从首页导航实时提取分类；识别不到则仅展示"全部"。
+		categories, err := engine.downloader.fetchMaccmsCustomCategories(ctx, source)
+		if err != nil || len(categories) == 0 {
+			return all, nil
+		}
+		merged := append(all, categories...)
+		engine.mu.Lock()
+		if engine.categoryOptions == nil {
+			engine.categoryOptions = map[string][]nativeCategory{}
+		}
+		engine.categoryOptions[source] = merged
+		engine.mu.Unlock()
+		return merged, nil
 	}
 	engine.mu.Lock()
 	cached := append([]nativeCategory{}, engine.categoryOptions[source]...)
@@ -129,13 +154,23 @@ func (engine *nativeEngine) nativeCategories(ctx context.Context, source string,
 		if err == nil {
 			all = append(all, categories...)
 		}
-	case sourceSorani:
-		all = append(all, d.fetchSoraniCategories()...)
 	case sourceGuipian:
 		all = append(all, d.fetchGuipianCategories()...)
 	case sourceHanxiaoquan:
 		all = append(all, d.fetchHanxiaoquanCategories()...)
+	case sourceIkanbot:
+		all = append(all, d.fetchIkanbotCategories()...)
+	case sourceA123:
+		all = append(all, d.fetchA123Categories()...)
 	default:
+		if isDuanjuProviderSource(source) {
+			var categories []nativeCategory
+			categories, err = d.fetchDuanjuCategories(ctx, source)
+			if err == nil {
+				all = append(all, categories...)
+			}
+			break
+		}
 		return nil, errors.New("请选择有效站源")
 	}
 	if err != nil {

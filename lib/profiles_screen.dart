@@ -8,6 +8,7 @@ import 'local_profiles.dart';
 import 'local_store.dart';
 import 'models.dart';
 import 'app_build.dart';
+import 'remote_widgets.dart';
 
 class ProfilesScreen extends StatefulWidget {
   const ProfilesScreen({super.key, required this.store, this.locked = false});
@@ -20,6 +21,12 @@ class ProfilesScreen extends StatefulWidget {
 class _ProfilesScreenState extends State<ProfilesScreen> {
   bool _busy = false;
   String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    ensureTelevisionFocus(context);
+  }
 
   Future<void> _recover({bool export = false, bool reload = false}) async {
     setState(() {
@@ -181,7 +188,7 @@ class _ProfilesScreenState extends State<ProfilesScreen> {
                 const Text('各用户的追剧和观看记录独立保存，下载文件由本机共享。'),
                 if (!widget.store.locked && widget.store.profile.admin) ...[
                   const SizedBox(height: 12),
-                  SwitchListTile(
+                  SwitchListTile.adaptive(
                     contentPadding: EdgeInsets.zero,
                     title: const Text('启动时需要登录'),
                     subtitle: Text(
@@ -312,8 +319,9 @@ class _ProfileEditorState extends State<ProfileEditor> {
   late final _name = TextEditingController(text: widget.profile?.name ?? '');
   final _pin = TextEditingController(), _confirm = TextEditingController();
   late final _sources =
-      (widget.profile?.sources ??
-              widget.store.sources.map((s) => s.id).toList())
+      (widget.profile?.sources ?? SourceSite.values.map((s) => s.id).toList())
+          // 已从版本移除的站源不再保留，保存时也不会写回。
+          .where((id) => SourceSite.isKnown(id))
           .toSet();
   late bool _download = widget.profile?.download ?? true;
   bool _clearPin = false, _busy = false;
@@ -419,7 +427,7 @@ class _ProfileEditorState extends State<ProfileEditor> {
             const SizedBox(height: 20),
             if (widget.profile?.admin != true) ...[
               Text('允许访问的站源', style: Theme.of(context).textTheme.titleMedium),
-              for (final source in widget.store.sources)
+              for (final source in SourceSite.values)
                 CheckboxListTile(
                   contentPadding: EdgeInsets.zero,
                   controlAffinity: ListTileControlAffinity.leading,
@@ -435,7 +443,7 @@ class _ProfileEditorState extends State<ProfileEditor> {
                     });
                   },
                 ),
-              SwitchListTile(
+              SwitchListTile.adaptive(
                 contentPadding: EdgeInsets.zero,
                 title: const Text('允许下载和本地媒体'),
                 subtitle: Text(_download ? '可下载、合并和导出' : '仅在线观看，隐藏下载入口'),

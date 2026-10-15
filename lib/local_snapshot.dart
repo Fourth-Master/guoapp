@@ -17,6 +17,9 @@ class LocalSnapshot {
     'mediaHistory',
     'source',
     'hideVip',
+    // 源显示列表的隐藏集合（每用户），必须列入受管字段，
+    // 否则开关站源显示会被 commit 判为「无效的本地配置字段」。
+    'hiddenSites',
     'playback',
     'downloadPreferences',
     'catalogView',
@@ -32,11 +35,10 @@ class LocalSnapshot {
     'themeMode',
     'autoExport',
     'exportPosters',
-    'sourceGateEnabled',
-    'sourceGateOff',
-    'sourceGateSalt',
-    'sourceGateHash',
     'forceLogin',
+    // 自定义源是设备级配置，所有本地用户共用，必须在受管字段内，
+    // 否则保存自定义源会被判为“无效的本地配置字段”。
+    'customSources',
   };
   final SharedPreferences preferences;
   Map<String, Object> _values = {};
@@ -45,7 +47,7 @@ class LocalSnapshot {
       globalKeys.contains(key) ||
       libraryKeys.contains(key) ||
       RegExp(
-        r'^profile\.[a-zA-Z0-9_-]{1,64}\.(history|favorites|followStates|seriesCandidates|mediaHistory|source|hideVip|playback|downloadPreferences|catalogView|recentSearches|lanRecords|lanSettings|lanReceipts)$',
+        r'^profile\.[a-zA-Z0-9_-]{1,64}\.(history|favorites|followStates|seriesCandidates|mediaHistory|source|hideVip|hiddenSites|playback|downloadPreferences|catalogView|recentSearches|lanRecords|lanSettings|lanReceipts)$',
       ).hasMatch(key);
 
   Map<String, Object> get values => Map.of(_values);
@@ -55,10 +57,18 @@ class LocalSnapshot {
   void reloadValues() {
     final raw = preferences.getString(storageKey);
     if (raw == null) {
-      _values = {
-        for (final key in preferences.getKeys().where(owns))
-          key: preferences.get(key)!,
-      };
+      // 旧版本逐键写入的记录：只接收类型正确的条目，历史脏数据直接忽略，
+      // 避免一条非法记录让整个本地配置无法加载。
+      final migrated = <String, Object>{};
+      for (final key in preferences.getKeys().where(owns)) {
+        final value = preferences.get(key);
+        if (value is String) {
+          migrated[key] = value;
+        } else if (value is bool) {
+          migrated[key] = value;
+        }
+      }
+      _values = migrated;
       _validate(_values);
       return;
     }
@@ -80,8 +90,6 @@ class LocalSnapshot {
         'hideVip',
         'autoExport',
         'exportPosters',
-        'sourceGateEnabled',
-        'sourceGateOff',
         'forceLogin',
       }.contains(entry.key.split('.').last);
       if (!owns(entry.key) ||

@@ -31,10 +31,10 @@ type Config struct {
 	YeguoURL         string
 	YeguoAPIURL      string
 	DSDURL           string
-	SoraniURL        string
-	SoraniAPIURL     string
 	GuipianURL       string
 	HanxiaoquanURL   string
+	IkanbotURL       string
+	A123URL          string
 	Token            string
 	AESKeyHex        string
 	InterfaceKey     string
@@ -50,6 +50,8 @@ type Downloader struct {
 	client                *http.Client
 	huangdouDetails       map[string]huangdouDetailEntry
 	huangdouDetailPending map[string]*huangdouDetailCall
+	ikanbotLineCache      map[string]ikanbotLineEntry
+	ikanbotLinePending    map[string]*ikanbotLineCall
 	providerMu            sync.Mutex
 	providerHosts         map[string]string
 	limiter               *requestLimiter
@@ -60,8 +62,6 @@ type Downloader struct {
 	huangju               *huangjuAPIClient
 	yeguoOnce             sync.Once
 	yeguo                 *yeguoAPIClient
-	soraniOnce            sync.Once
-	sorani                *soraniAPIClient
 	dsdCatalog            dsdCatalogState
 	diagnostics           *diagnosticLog
 	apiMu                 sync.Mutex
@@ -109,6 +109,10 @@ type nativeInput struct {
 	Action           string                  `json:"action"`
 	Directory        string                  `json:"directory"`
 	Source           string                  `json:"source"`
+	Name             string                  `json:"name"`
+	Base             string                  `json:"base"`
+	Rule             string                  `json:"rule"`
+	Content          string                  `json:"content"`
 	Page             int                     `json:"page"`
 	Query            string                  `json:"query"`
 	Category         string                  `json:"category"`
@@ -116,9 +120,11 @@ type nativeInput struct {
 	Chapter          Chapter                 `json:"chapter"`
 	Index            int                     `json:"index"`
 	Quality          int                     `json:"quality"`
+	Route            int                     `json:"route"`
 	Session          string                  `json:"session"`
 	Sequence         int64                   `json:"sequence"`
 	Force            bool                    `json:"force"`
+	AdBlock          *bool                   `json:"adBlock"`
 }
 
 type nativeCatalogResult struct {
@@ -177,6 +183,7 @@ type nativeEngine struct {
 	sourceRecords    map[string]nativeSourceRecord
 	sourceCatalogMu  sync.Mutex
 	sourceCatalogs   map[string]chan struct{}
+	customRegistry   *customMaccmsRegistry
 }
 
 var nativeState struct {
@@ -261,7 +268,10 @@ func newNativeEngine(directory string) (*nativeEngine, error) {
 	d := &Downloader{cfg: cfg, providerHosts: map[string]string{}, proxyRouter: router,
 		limiter: newRequestLimiter(3, 250*time.Millisecond), diagnostics: newDiagnosticLog(directory)}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	// RootCAs 设为「系统信任库 + 打包 CA 全集」。Android 端 Go 不加载系统信任库，
+	// 打包 CA 在此提供信任锚（含 Certum 等小众公共根），从而修复 m3u8 等媒体请求的
+	// "certificate signed by unknown authority"。其余平台行为不变。
+	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: systemCertPoolWithBundle()}
 	transport.MaxIdleConnsPerHost = 8
 	transport.ResponseHeaderTimeout = 20 * time.Second
 	transport.Proxy = router.proxy
@@ -280,6 +290,10 @@ func newNativeEngine(directory string) (*nativeEngine, error) {
 	engine.loadResourceSettings()
 	d.loadRankingCache()
 	engine.loadCatalogCache()
+	// 自定义源注册表必须先于 sources.json 加载：
+	// loadSourceRecords 里的 isHuangguoProviderSource 要能认出 custom:<hash> 记录才不会丢任务状态。
+	engine.customRegistry = newCustomMaccmsRegistry(directory)
+	engine.customRegistry.load()
 	engine.loadSourceRecords()
 	engine.covers = newNativeCoverCache(directory, d)
 	engine.downloads = newNativeDownloads(engine)
@@ -345,12 +359,18 @@ func nativeDispatch(input nativeInput) (any, error) {
 	nativeState.Lock()
 	if input.Action == "initialize" {
 		if nativeState.engine == nil {
+			// newNativeEngine 内部会经 isHuangguoProviderSource 读取全局引擎（自定义源判定），
+			// 持锁创建会自死锁；先解锁创建，再上锁安装，并发 initialize 时以先装上的引擎为准。
+			nativeState.Unlock()
 			engine, err := newNativeEngine(input.Directory)
+			nativeState.Lock()
 			if err != nil {
 				nativeState.Unlock()
 				return nil, err
 			}
-			nativeState.engine = engine
+			if nativeState.engine == nil {
+				nativeState.engine = engine
+			}
 		}
 		nativeState.Unlock()
 		return map[string]any{"version": "0.2.17", "standalone": true, "allSources": buildAllSources == "true"}, nil
@@ -454,6 +474,43 @@ func nativeDispatch(input nativeInput) (any, error) {
 		return engine.startSourceTask(input.Source, input.Command, input.Drama)
 	case "cancelSourceJob":
 		return engine.cancelSourceTask(input.Source), nil
+	case "customSources":
+		return map[string]any{"items": engine.customMaccmsSources()}, nil
+	case "addCustomSource":
+		record, err := engine.addCustomMaccmsSource(input.Name, input.Base, input.Rule)
+		if err != nil {
+			return nil, err
+		}
+		return record, nil
+	case "updateCustomSource":
+		record, err := engine.updateCustomMaccmsSource(input.Source, input.Name, input.Base, input.Rule)
+		if err != nil {
+			return nil, err
+		}
+		return record, nil
+	case "removeCustomSource":
+		return true, engine.removeCustomMaccmsSource(input.Source)
+	case "exportCustomSources":
+		content, err := engine.exportCustomMaccmsSources()
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"content": content, "filename": customSourceExportFilename()}, nil
+	case "importCustomSources":
+		if strings.TrimSpace(input.Content) == "" {
+			return nil, errors.New("导入内容为空")
+		}
+		result, err := engine.importCustomMaccmsSources(input.Content)
+		if err != nil {
+			return nil, err
+		}
+		return result, nil
+	case "resetCustomSources":
+		removed, err := engine.resetCustomMaccmsSources()
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"removed": removed}, nil
 	case "cover":
 		return engine.loadCover(ctx, input.Drama, input.Force)
 	case "prepareCover":
@@ -472,6 +529,13 @@ func nativeDispatch(input nativeInput) (any, error) {
 			return engine.nativeNextPlayback(playback, input.Session)
 		}
 		return engine.nativeResolve(playback, input)
+	case "selectRoute":
+		playback, finish, err := engine.nativeBeginPlayback(ctx, input.Sequence)
+		if err != nil {
+			return nil, err
+		}
+		defer finish()
+		return engine.nativeSelectRoute(playback, input.Session, input.Route)
 	case "cancelPlayback":
 		engine.nativeCancelPlayback(input.Sequence)
 		return true, nil
@@ -538,17 +602,6 @@ func (engine *nativeEngine) nativeCatalog(ctx context.Context, input nativeInput
 		result.HasMore = more
 		return result, nil
 	}
-	if query != "" && source == sourceSorani {
-		items, more, err := d.fetchSoraniCatalogPage(ctx, page, "", query)
-		if err != nil {
-			return result, err
-		}
-		for _, drama := range items {
-			result.Items = append(result.Items, nativeNormalize(drama))
-		}
-		result.HasMore = more
-		return result, nil
-	}
 	if query != "" && source == sourceGuipian {
 		items, more, err := d.fetchGuipianCatalogPage(ctx, page, "", query)
 		if err != nil {
@@ -579,6 +632,37 @@ func (engine *nativeEngine) nativeCatalog(ctx context.Context, input nativeInput
 			items, more, err = d.fetchYeguoCatalogPage(ctx, page, "", query)
 		} else {
 			items, more, err = d.fetchDSDCatalogPage(ctx, page, "", query)
+		}
+		if err != nil {
+			return result, err
+		}
+		for _, drama := range items {
+			result.Items = append(result.Items, nativeNormalize(drama))
+		}
+		result.HasMore = more
+		return result, nil
+	}
+	if query != "" && isDuanjuProviderSource(source) {
+		if !duanjuSupportsSearch(source) {
+			return result, fmt.Errorf("%s 暂不支持在线搜索，可在已加载内容中筛选", duanjuSourceName(source))
+		}
+		items, err := d.searchDuanju(ctx, source, query)
+		if err != nil {
+			return result, err
+		}
+		for _, drama := range items {
+			result.Items = append(result.Items, nativeNormalize(drama))
+		}
+		return result, nil
+	}
+	if query != "" && (source == sourceA123 || source == sourceIkanbot) {
+		var items []Drama
+		var more bool
+		var err error
+		if source == sourceA123 {
+			items, more, err = d.fetchA123CatalogPage(ctx, page, "", query)
+		} else {
+			items, more, err = d.fetchIkanbotCatalogPage(ctx, page, "", query)
 		}
 		if err != nil {
 			return result, err
@@ -661,12 +745,14 @@ func (engine *nativeEngine) nativeCatalog(ctx context.Context, input nativeInput
 		items, result.HasMore, err = d.fetchYeguoCatalogPage(ctx, page, category, "")
 	case sourceDSD:
 		items, result.HasMore, err = d.fetchDSDCatalogPage(ctx, page, category, "")
-	case sourceSorani:
-		items, result.HasMore, err = d.fetchSoraniCatalogPage(ctx, page, category, "")
 	case sourceGuipian:
 		items, result.HasMore, err = d.fetchGuipianCatalogPage(ctx, page, category, "")
 	case sourceHanxiaoquan:
 		items, result.HasMore, err = d.fetchHanxiaoquanCatalogPage(ctx, page, category, "")
+	case sourceIkanbot:
+		items, result.HasMore, err = d.fetchIkanbotCatalogPage(ctx, page, category, "")
+	case sourceA123:
+		items, result.HasMore, err = d.fetchA123CatalogPage(ctx, page, category, "")
 	case sourceHuangguoVideo:
 		address := fmt.Sprintf("%s/videos?page=%d", d.providerBaseURL(source), page)
 		if category != "" {
@@ -680,11 +766,15 @@ func (engine *nativeEngine) nativeCatalog(ctx context.Context, input nativeInput
 		result.HasMore = len(items) >= 20
 	case sourceCloudFront:
 		items, result.HasMore, err = d.fetchLegacyCatalogCategoryPage(ctx, page, category)
+	default:
+		if isDuanjuProviderSource(source) {
+			items, result.HasMore, err = d.fetchDuanjuCatalogPage(ctx, source, page, category)
+		}
 	}
 	if err != nil && len(items) == 0 {
 		return result, err
 	}
-	if len(items) == 0 && page == 1 && source != sourceHuangju && source != sourceYeguo && source != sourceDSD && source != sourceSorani && source != sourceGuipian && source != sourceHanxiaoquan {
+	if len(items) == 0 && page == 1 && source != sourceHuangju && source != sourceYeguo && source != sourceDSD && source != sourceGuipian && source != sourceHanxiaoquan && source != sourceIkanbot && source != sourceA123 && !isDuanjuProviderSource(source) {
 		return result, errors.New("站源暂未返回剧集，请稍后刷新")
 	}
 	if err != nil {
@@ -724,13 +814,19 @@ func (engine *nativeEngine) nativeDetail(ctx context.Context, drama nativeDrama)
 		raw, chapters, err = engine.downloader.fetchYeguoDetail(ctx, sourceID)
 	case sourceDSD:
 		raw, chapters, err = engine.downloader.fetchDSDDetail(ctx, sourceID)
-	case sourceSorani:
-		raw, chapters, err = engine.downloader.fetchSoraniDetail(ctx, sourceID)
 	case sourceGuipian:
 		raw, chapters, err = engine.downloader.fetchGuipianDetail(ctx, sourceID)
 	case sourceHanxiaoquan:
 		raw, chapters, err = engine.downloader.fetchHanxiaoquanDetail(ctx, sourceID)
+	case sourceIkanbot:
+		raw, chapters, err = engine.downloader.fetchIkanbotDetail(ctx, sourceID)
+	case sourceA123:
+		raw, chapters, err = engine.downloader.fetchA123Detail(ctx, sourceID)
 	default:
+		if isDuanjuProviderSource(source) {
+			raw, chapters, err = engine.downloader.fetchDuanjuDetail(ctx, source, sourceID)
+			break
+		}
 		title, chapters, err = engine.downloader.GetHuangguoChapters(ctx, source, sourceID)
 	}
 	if err != nil {
@@ -788,5 +884,8 @@ func (engine *nativeEngine) nativeResolve(ctx context.Context, input nativeInput
 	if series, video, valid := hongguoPlaybackIDs(task); valid {
 		choice.danmakuSeries, choice.danmakuVideo = series, video
 	}
+	// 去广告开关：请求未显式给出时默认开启。
+	choice.adBlock = input.AdBlock == nil || *input.AdBlock
+	choice.index = nativePreferredRoute(input.Route, len(choice.media))
 	return engine.nativeOpenPlayback(ctx, choice)
 }

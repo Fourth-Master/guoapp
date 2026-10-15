@@ -36,15 +36,14 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
-        manifestPlaceholders["appLabel"] = if (allSources) "真果鉴" else "红果鉴"
+        manifestPlaceholders["appLabel"] = if (allSources) "全剧视界" else "短剧视界"
         manifestPlaceholders["appBanner"] = if (allSources) "@drawable/tv_banner_all_sources" else "@drawable/tv_banner"
     }
 
     signingConfigs {
         if (releaseKey.exists()) {
             create("release") {
-                val rawStore = requireNotNull(releaseProperties.getProperty("storeFile"))
-                storeFile = if (file(rawStore).exists()) file(rawStore) else rootProject.file(rawStore)
+                storeFile = file(requireNotNull(releaseProperties.getProperty("storeFile")))
                 storePassword = requireNotNull(releaseProperties.getProperty("storePassword"))
                 keyAlias = requireNotNull(releaseProperties.getProperty("keyAlias"))
                 keyPassword = requireNotNull(releaseProperties.getProperty("keyPassword"))

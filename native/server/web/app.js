@@ -1,0 +1,2138 @@
+'use strict';
+
+var view = document.getElementById('view');
+var sourceSelect = document.getElementById('source');
+var searchInput = document.getElementById('search-input');
+var searchForm = document.getElementById('search-form');
+
+// 自动连播的开关存在浏览器本地，换浏览器重开也保留上次的选择。
+var AUTO_NEXT_KEY = 'duanjuweb:autoNext';
+// 倍速同样记在本地：切集会重建 <video>，不记下来就会被打回 1 倍速。
+var PLAY_RATE_KEY = 'duanjuweb:playbackRate';
+// 去广告开关默认开，记在本地；关闭后播放加载原画。
+var AD_BLOCK_KEY = 'duanjuweb:adBlock';
+
+function readAdBlock() {
+  try {
+    return window.localStorage.getItem(AD_BLOCK_KEY) !== 'off';
+  } catch (error) {
+    return true;
+  }
+}
+
+function writeAdBlock(value) {
+  try {
+    window.localStorage.setItem(AD_BLOCK_KEY, value ? 'on' : 'off');
+  } catch (error) {
+    // 隐私模式下写不了本地存储，只在当前会话生效。
+  }
+}
+
+var playbackRate = readPlaybackRate();
+var resumeFullscreen = false;
+var suppressHashRender = false;
+var mountToken = 0;
+
+function readPlaybackRate() {
+  try {
+    var value = Number(window.localStorage.getItem(PLAY_RATE_KEY));
+    if (value >= 0.25 && value <= 4) {
+      return value;
+    }
+  } catch (error) {
+    // 隐私模式读不到本地存储时用默认倍速。
+  }
+  return 1;
+}
+
+function writePlaybackRate(value) {
+  try {
+    window.localStorage.setItem(PLAY_RATE_KEY, String(value));
+  } catch (error) {
+    // 写不进去只在当前会话生效，不影响播放。
+  }
+}
+
+function readAutoNext() {
+  try {
+    return window.localStorage.getItem(AUTO_NEXT_KEY) !== 'off';
+  } catch (error) {
+    return true;
+  }
+}
+
+function writeAutoNext(value) {
+  try {
+    window.localStorage.setItem(AUTO_NEXT_KEY, value ? 'on' : 'off');
+  } catch (error) {
+    // 隐私模式下写不了本地存储，只在当前会话生效。
+  }
+}
+
+var state = {
+  source: 'hongguo',
+  categories: [],
+  categoriesSource: '',
+  category: '',
+  page: 1,
+  query: '',
+  hasMore: false,
+  drama: null,
+  chapters: [],
+  plan: null,
+  index: 0,
+  quality: 0,
+  route: 0,
+  sourceNames: {},
+  ffmpeg: true,
+  autoNext: readAutoNext(),
+  adBlock: readAdBlock(),
+  library: { history: [], favorites: [] },
+  libraryTab: 'history',
+  libraryEditing: false,
+  librarySelected: {},
+};
+
+var hlsInstance = null;
+var blackWatchdog = null;
+var lastProgressSave = 0;
+var autoNextTimer = null;
+
+// 播放失败自动换线（对齐 Flutter 端 fallback 机制）：
+// hls.js 出现致命网络/媒体错误时，自动请求下一条线路重建播放，
+// 全部线路试完才提示播放失败。
+var routeTried = {};
+var routeTotal = 1;
+var failoverBusy = false;
+// 换线前先给当前线路一次原地重试的机会：网络抖动、瞬时限流多数重试即恢复，
+// 避免一次抖动就误判死线路。每条线路在一条"连续失败链"里只享受一次这种宽容。
+var sameLineRetried = false;
+var sameLineRetryTimer = null;
+var lastMountUrl = '';
+
+function markRouteTried(route) {
+  routeTried[route] = true;
+}
+
+function resetRouteTried(route, total) {
+  routeTried = {};
+  routeTotal = total || 1;
+  sameLineRetried = false;
+  markRouteTried(route || 0);
+}
+
+function nextRouteToTry() {
+  for (var route = 0; route < routeTotal; route += 1) {
+    if (!routeTried[route]) {
+      return route;
+    }
+  }
+  return -1;
+}
+
+function failoverRoute(reasonText, skipSameLineRetry) {
+  var drama = state.drama;
+  var chapters = state.chapters || [];
+  var plan = state.plan;
+  var video = document.getElementById('player');
+  if (!drama || !plan || !video || failoverBusy) {
+    return;
+  }
+  // 宽容第一层：换线前先在当前线路上原地重试一次。
+  // 网络抖动、瞬时限流大多重试即恢复，不该因此放弃一条本来能播的线路。
+  // skipSameLineRetry 用于确定性故障（如编码不支持），重试也不会变，直接换线。
+  if (!sameLineRetried && !skipSameLineRetry) {
+    sameLineRetried = true;
+    var retryToken = mountToken;
+    var resumePos = video.currentTime || 0;
+    showNotice('当前线路加载异常，正在原线路重试…', 'switching');
+    if (hlsInstance && lastMountUrl) {
+      // 只重拉清单，复用同一个 <video>：播放位置由 hls.js 按当前时间续上。
+      hlsInstance.loadSource(lastMountUrl);
+    } else if (lastMountUrl) {
+      video.src = lastMountUrl;
+      if (resumePos > 0) {
+        video.addEventListener(
+          'loadedmetadata',
+          function () {
+            try {
+              video.currentTime = resumePos;
+            } catch (error) {
+              // 个别流不允许跳转，忽略即可。
+            }
+          },
+          { once: true },
+        );
+      }
+      video.play().catch(function () {});
+    }
+    // 重试后既没报错也没恢复时（如错误只触发一次的场景），25 秒后兜底继续换线。
+    if (sameLineRetryTimer) {
+      clearTimeout(sameLineRetryTimer);
+    }
+    sameLineRetryTimer = setTimeout(function () {
+      sameLineRetryTimer = null;
+      if (retryToken !== mountToken) {
+        return; // 已重建播放（换线/换集），旧兜底作废
+      }
+      if (video.videoWidth > 0 && !video.paused) {
+        return; // 已恢复播放，不需要换线
+      }
+      failoverRoute(reasonText, true);
+    }, 25000);
+    return;
+  }
+  // 宽容第二层：重试仍失败才真正换线。
+  var mountAt = mountToken;
+  var route = nextRouteToTry();
+  if (route < 0) {
+    showNotice('播放失败：' + (reasonText || '未知错误') + '（已尝试全部 ' + routeTotal + ' 条线路）');
+    return;
+  }
+  failoverBusy = true;
+  markRouteTried(route);
+  showNotice('当前线路无法播放，正在自动切换到线路 ' + (route + 1) + '/' + routeTotal + '…', 'switching');
+  apiPlay({
+    drama: drama,
+    chapter: chapters[state.index],
+    index: state.index,
+    quality: state.quality || 0,
+    route: route,
+  })
+    .then(function (next) {
+      if (mountAt !== mountToken) {
+        return; // 用户已手动切线路/换集，放弃这次迟到的换线结果
+      }
+      state.plan = next;
+      state.route = route;
+      routeTotal = next.routeCount || routeTotal;
+      var routeBox = document.getElementById('route-select');
+      if (routeBox) {
+        routeBox.value = String(route);
+      }
+      // 新线路也享有同等的"先原线重试"宽容，mountVideo 里会重置计数。
+      // 新线路是新的播放会话，沿用同一 <video> 就地重建，倍速/全屏都不丢。
+      mountVideo(next.url, 0);
+    })
+    .catch(function () {
+      if (mountAt !== mountToken) {
+        return;
+      }
+      showNotice('线路 ' + (route + 1) + ' 解析失败，正在尝试其它线路…');
+      setTimeout(function () {
+        failoverBusy = false;
+        if (mountAt === mountToken) {
+          // 线路解析失败没有可重试的会话，直接试下一条
+          failoverRoute(reasonText, true);
+        }
+      }, 1500);
+    })
+    .finally(function () {
+      failoverBusy = false;
+    });
+}
+
+function escapeHTML(value) {
+  return String(value === undefined || value === null ? '' : value).replace(/[&<>"']/g, function (char) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char];
+  });
+}
+
+function api(payload) {
+  return fetch('/api/request', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+    .then(function (response) {
+      return response.json();
+    })
+    .then(function (data) {
+      if (!data.ok) {
+        throw new Error(data.error || '请求失败');
+      }
+      return data.data;
+    });
+}
+
+function coverSrc(drama) {
+  if (!drama || !drama.id) {
+    return '';
+  }
+  var query = new URLSearchParams();
+  query.set('id', drama.id);
+  if (drama.source) {
+    query.set('source', String(drama.source));
+  }
+  var cover = drama.cover ? String(drama.cover) : '';
+  if (/^https?:\/\//i.test(cover)) {
+    query.set('u', cover);
+  }
+  return '/api/cover?' + query.toString();
+}
+
+function coverHTML(drama) {
+  var url = coverSrc(drama);
+  if (!url) {
+    return '<div class="cover"><div class="fallback">' + escapeHTML(drama.title || '无封面') + '</div></div>';
+  }
+  return (
+    '<div class="cover"><img loading="lazy" src="' +
+    escapeHTML(url) +
+    '" alt="" onerror="this.style.display=\'none\'" /></div>'
+  );
+}
+
+/* ---------- 收藏夹与播放记录 ---------- */
+
+function libraryRequest(payload) {
+  return fetch('/api/library', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+    .then(function (response) {
+      return response.json();
+    })
+    .then(function (data) {
+      if (!data.ok) {
+        throw new Error(data.error || '收藏夹更新失败');
+      }
+      state.library = { history: data.data.history || [], favorites: data.data.favorites || [] };
+      return state.library;
+    });
+}
+
+function loadLibrary() {
+  return fetch('/api/library')
+    .then(function (response) {
+      return response.json();
+    })
+    .then(function (data) {
+      if (data && data.ok && data.data) {
+        state.library = { history: data.data.history || [], favorites: data.data.favorites || [] };
+      }
+      return state.library;
+    })
+    .catch(function () {
+      return state.library;
+    });
+}
+
+function entryKey(drama) {
+  var source = (drama && (drama.source || state.source)) || '';
+  return String(source) + '|' + String((drama && drama.id) || '');
+}
+
+function sourceLabel(source) {
+  return state.sourceNames[source] || source || '';
+}
+
+// 播放记录要带上海报、片名、站源名称与看到第几集、看到几分几秒。
+function currentEntry(position, duration) {
+  var drama = state.drama || {};
+  var chapter = (state.chapters || [])[state.index] || {};
+  return {
+    id: drama.id || '',
+    source: drama.source || state.source || '',
+    sourceName: sourceLabel(drama.source || state.source),
+    title: drama.title || '',
+    cover: drama.cover || '',
+    episodes: drama.episodes ? String(drama.episodes) : '',
+    index: state.index,
+    episodeTitle: chapter.title || '',
+    position: position || 0,
+    duration: duration || 0,
+    updatedAt: Date.now(),
+  };
+}
+
+function findEntry(list, key, index) {
+  for (var i = 0; i < list.length; i += 1) {
+    if (entryKey(list[i]) !== key) {
+      continue;
+    }
+    if (typeof index === 'number' && Number(list[i].index || 0) !== index) {
+      continue;
+    }
+    return list[i];
+  }
+  return null;
+}
+
+function isFavorite(drama) {
+  return !!findEntry(state.library.favorites, entryKey(drama || state.drama));
+}
+
+function formatTime(seconds) {
+  var total = Math.max(0, Math.floor(Number(seconds) || 0));
+  var hours = Math.floor(total / 3600);
+  var minutes = Math.floor((total % 3600) / 60);
+  var rest = total % 60;
+  var mm = String(minutes).padStart(hours ? 2 : 1, '0');
+  var ss = String(rest).padStart(2, '0');
+  return (hours ? hours + ':' + mm : mm) + ':' + ss;
+}
+
+function progressText(entry) {
+  var parts = ['第 ' + (Number(entry.index || 0) + 1) + ' 集'];
+  if (entry.duration > 0 && entry.position > 0) {
+    parts.push(formatTime(entry.position) + ' / ' + formatTime(entry.duration));
+  } else if (entry.position > 0) {
+    parts.push('看到 ' + formatTime(entry.position));
+  } else {
+    parts.push('刚开始');
+  }
+  if (entry.episodeTitle && !/^第\s*\d+\s*集$/.test(entry.episodeTitle.trim())) {
+    parts.push(entry.episodeTitle);
+  }
+  return parts.join(' · ');
+}
+
+function progressPercent(entry) {
+  if (!(entry.duration > 0) || !(entry.position > 0)) {
+    return 0;
+  }
+  return Math.min(100, Math.round((entry.position / entry.duration) * 100));
+}
+
+// 播放进度每 5 秒上报一次，切集、暂停、离开页面时立刻补一次。
+function reportProgress(force) {
+  if (!state.drama) {
+    return;
+  }
+  var video = document.getElementById('player');
+  if (!video) {
+    return;
+  }
+  var position = Number(video.currentTime) || 0;
+  if (!(position > 0)) {
+    return;
+  }
+  var now = Date.now();
+  if (!force && now - lastProgressSave < 5000) {
+    return;
+  }
+  lastProgressSave = now;
+  libraryRequest({
+    list: 'history',
+    op: 'put',
+    item: currentEntry(position, Number(video.duration) || 0),
+  }).catch(function () {});
+}
+
+function flushProgress() {
+  reportProgress(true);
+}
+
+function hashParams() {
+  var raw = location.hash.replace(/^#\/?/, '');
+  var parts = raw.split('?');
+  return { path: parts[0] || 'home', params: new URLSearchParams(parts[1] || '') };
+}
+
+function link(hash) {
+  return hash;
+}
+
+function loadSources() {
+  return fetch('/api/sources')
+    .then(function (response) {
+      return response.json();
+    })
+    .then(function (data) {
+      var items = (data && data.items) || [];
+      state.sourceNames = {};
+      // 保留全部站源名称映射（含隐藏的），供收藏夹/播放记录标注来源。
+      items.forEach(function (item) {
+        state.sourceNames[item.id] = item.name;
+      });
+      // 下拉框只列「源显示列表」中开启的站源。
+      var visibleItems = items.filter(function (item) {
+        return item.visible !== false;
+      });
+      sourceSelect.innerHTML = visibleItems.length
+        ? visibleItems
+            .map(function (item) {
+              return '<option value="' + escapeHTML(item.id) + '">' + escapeHTML(item.name) + '</option>';
+            })
+            .join('')
+        : '<option value="">无显示中的站源</option>';
+      if (visibleItems.length && !visibleItems.some(function (item) { return item.id === state.source; })) {
+        state.source = visibleItems[0].id;
+      }
+      sourceSelect.value = state.source;
+    })
+    .catch(function () {});
+}
+
+function loadInfo() {
+  return fetch('/api/info')
+    .then(function (response) {
+      return response.json();
+    })
+    .then(function (data) {
+      if (data && data.name) {
+        document.getElementById('brand').textContent = data.name;
+        document.title = data.name;
+      }
+      state.ffmpeg = !(data && data.ffmpeg === '');
+    })
+    .catch(function () {});
+}
+
+var FFMPEG_MISSING =
+  '未检测到 ffmpeg：红果等加密站源需要服务端转码才能播放，其余站源不受影响。' +
+  'Windows 上重新运行 start.bat 会提示下载 ffmpeg；也可以执行 winget install ffmpeg 后重启服务。';
+
+function ffmpegNotice() {
+  if (state.ffmpeg) {
+    return '';
+  }
+  return (
+    '<div class="notice" style="display:block">' +
+    escapeHTML(FFMPEG_MISSING) +
+    ' <button type="button" id="ffmpeg-recheck" class="link-btn">重新检测</button>' +
+    '</div>'
+  );
+}
+
+function bindFFmpegRecheck() {
+  var button = document.getElementById('ffmpeg-recheck');
+  if (!button) {
+    return;
+  }
+  button.addEventListener('click', function () {
+    button.disabled = true;
+    button.textContent = '检测中…';
+    loadInfo().then(function () {
+      render();
+    });
+  });
+}
+
+function loadCategories(force) {
+  if (!force && state.categories.length && state.categoriesSource === state.source) {
+    return Promise.resolve(state.categories);
+  }
+  return api({ action: 'categories', source: state.source })
+    .then(function (data) {
+      state.categories = (data.items || []).map(function (item) {
+        return { id: item.id || '', name: item.name };
+      });
+      state.categoriesSource = state.source;
+      return state.categories;
+    })
+    .catch(function () {
+      state.categories = [{ id: '', name: '全部' }];
+      state.categoriesSource = state.source;
+      return state.categories;
+    });
+}
+
+function hashFor(overrides) {
+  var merged = {
+    source: state.source,
+    category: state.category,
+    page: state.page,
+    q: state.query,
+  };
+  Object.keys(overrides || {}).forEach(function (key) {
+    merged[key] = overrides[key];
+  });
+  var query = new URLSearchParams();
+  query.set('source', merged.source);
+  if (merged.category) query.set('category', merged.category);
+  if (merged.q) query.set('q', merged.q);
+  query.set('page', String(merged.page));
+  return '#/home?' + query.toString();
+}
+
+function renderCatalog() {
+  view.innerHTML = '<div class="loading">正在加载剧库…</div>';
+  return loadCategories(false).then(function (categories) {
+    var payload = {
+      action: 'catalog',
+      source: state.source,
+      category: state.category,
+      page: state.page,
+    };
+    if (state.query) {
+      payload.query = state.query;
+    }
+    return api(payload).catch(function (error) {
+      if (state.category === '' && categories.length > 1) {
+        state.category = categories[1].id;
+        return api({ action: 'catalog', source: state.source, category: state.category, page: state.page });
+      }
+      throw error;
+    });
+  }).then(function (result) {
+    var items = result.items || [];
+    state.hasMore = !!result.hasMore;
+    var chips = state.categories
+      .map(function (item) {
+        var active = item.id === state.category ? ' active' : '';
+        return (
+          '<a class="chip' + active + '" href="' +
+          escapeHTML(link(hashFor({ category: item.id, page: 1 }))) +
+          '">' + escapeHTML(item.name) + '</a>'
+        );
+      })
+      .join('');
+    var cards = items
+      .map(function (drama) {
+        return (
+          '<div class="card"><a href="#/drama?id=' + encodeURIComponent(drama.id) + '">' +
+          coverHTML(drama) +
+          '<div class="title">' + escapeHTML(drama.title) + '</div>' +
+          '<div class="meta">' + escapeHTML(drama.episodes ? drama.episodes + ' 集' : '') + '</div>' +
+          '</a></div>'
+        );
+      })
+      .join('');
+    if (!cards) {
+      cards = '<div class="empty">没有找到内容，换个分类或关键词试试。</div>';
+    }
+    var previous = state.page > 1
+      ? '<a href="' + escapeHTML(link(hashFor({ page: state.page - 1 }))) + '">上一页</a>'
+      : '<span class="disabled">上一页</span>';
+    var next = state.hasMore
+      ? '<a href="' + escapeHTML(link(hashFor({ page: state.page + 1 }))) + '">下一页</a>'
+      : '<span class="disabled">下一页</span>';
+    view.innerHTML =
+      ffmpegNotice() +
+      '<div class="chips">' + chips + '</div>' +
+      '<div class="grid">' + cards + '</div>' +
+      '<div class="pager">' + previous + '<span>第 ' + state.page + ' 页</span>' + next + '</div>';
+    bindFFmpegRecheck();
+  });
+}
+
+function ensureDrama(id, source) {
+  if (
+    state.drama &&
+    state.drama.id === id &&
+    (!source || !state.drama.source || state.drama.source === source)
+  ) {
+    return Promise.resolve(state.drama);
+  }
+  var drama = { id: id };
+  if (source) {
+    drama.source = source;
+  }
+  return api({ action: 'detail', drama: drama }).then(function (data) {
+    state.drama = data.drama;
+    state.chapters = data.chapters || [];
+    return state.drama;
+  });
+}
+
+function renderDrama(id, source) {
+  view.innerHTML = '<div class="loading">正在加载剧集详情…</div>';
+  return ensureDrama(id, source).then(function (drama) {
+    var episodes = (state.chapters || [])
+      .map(function (chapter, index) {
+        return (
+          '<a href="#/play?id=' + encodeURIComponent(drama.id) +
+          '&index=' + index +
+          (drama.source ? '&source=' + encodeURIComponent(drama.source) : '') + '">' +
+          escapeHTML(chapter.title || '第 ' + (index + 1) + ' 集') +
+          '</a>'
+        );
+      })
+      .join('');
+    view.innerHTML =
+      '<div class="detail">' +
+      '<div class="poster">' + coverHTML(drama) + '</div>' +
+      '<div class="info">' +
+      '<h1>' + escapeHTML(drama.title) + '</h1>' +
+      '<div class="desc">' + escapeHTML(drama.description || '暂无简介') + '</div>' +
+      '<div class="meta" style="color:var(--muted)">共 ' + (state.chapters || []).length + ' 集</div>' +
+      '<div class="detail-actions">' +
+      '<button type="button" class="btn" id="fav-toggle">' +
+      (isFavorite(drama) ? '已收藏' : '收藏') +
+      '</button>' +
+      '</div>' +
+      '</div></div>' +
+      '<div class="episodes">' + episodes + '</div>';
+    bindFavoriteToggle(drama);
+  });
+}
+
+function favoritePayload(drama) {
+  return {
+    id: drama.id || '',
+    source: drama.source || state.source || '',
+    sourceName: sourceLabel(drama.source || state.source),
+    title: drama.title || '',
+    cover: drama.cover || '',
+    episodes: drama.episodes ? String(drama.episodes) : '',
+    index: 0,
+    episodeTitle: '',
+    position: 0,
+    duration: 0,
+    updatedAt: Date.now(),
+  };
+}
+
+// 点一次加入收藏，再点一次取消。
+function bindFavoriteToggle(drama) {
+  var button = document.getElementById('fav-toggle');
+  if (!button) {
+    return;
+  }
+  button.addEventListener('click', function () {
+    button.disabled = true;
+    libraryRequest({ list: 'favorites', op: 'toggle', item: favoritePayload(drama) })
+      .then(function () {
+        var active = isFavorite(drama);
+        button.textContent = active ? '已收藏' : '收藏';
+        button.classList.toggle('active', active);
+        button.disabled = false;
+      })
+      .catch(function (error) {
+        button.disabled = false;
+        showNotice(error.message || '收藏失败');
+      });
+  });
+}
+
+function episodeHash(id, source, index) {
+  return (
+    '#/play?id=' + encodeURIComponent(id) +
+    '&index=' + index +
+    (source ? '&source=' + encodeURIComponent(source) : '')
+  );
+}
+
+// 自动连播不再做倒计时确认，播完直接加载下一集。
+function stopAutoNextTimer() {
+  if (autoNextTimer) {
+    clearInterval(autoNextTimer);
+    autoNextTimer = null;
+  }
+}
+
+function cancelAutoNext() {
+  stopAutoNextTimer();
+  var box = document.getElementById('next-up');
+  if (box) {
+    box.style.display = 'none';
+  }
+}
+
+// 换集时同步标题与上一集/下一集按钮状态，并让地址栏跟上（不触发整页重建）。
+function syncEpisodeChrome(index) {
+  var drama = state.drama;
+  var chapters = state.chapters || [];
+  var title = document.querySelector('.player-title');
+  if (title && drama) {
+    title.textContent = drama.title + ' · ' + ((chapters[index] || {}).title || '');
+  }
+  var next = document.getElementById('episode-next');
+  if (next && drama) {
+    if (index + 1 < chapters.length) {
+      next.disabled = false;
+      next.style.display = '';
+    } else {
+      next.style.display = 'none';
+    }
+  }
+  var previous = document.getElementById('episode-previous');
+  if (previous && drama) {
+    if (index > 0) {
+      previous.disabled = false;
+      previous.style.display = '';
+    } else {
+      previous.style.display = 'none';
+    }
+  }
+  var hash = drama ? episodeHash(drama.id, drama.source, index) : '';
+  if (hash && location.hash !== hash) {
+    // 只改地址栏，并标记本次 hashchange 不重建页面（就地换集复用同一个 <video>）。
+    suppressHashRender = true;
+    location.hash = hash;
+  }
+}
+
+// 就地换集：复用同一个 <video>，全屏和倍速都不会被重置。
+function playNextEpisode() {
+  var drama = state.drama;
+  var chapters = state.chapters || [];
+  var nextIndex = state.index + 1;
+  var video = document.getElementById('player');
+  if (!drama || nextIndex >= chapters.length) {
+    return Promise.resolve(false);
+  }
+  cancelAutoNext();
+  if (!video) {
+    // 播放器还没建好时退回整页跳转。
+    location.hash = episodeHash(drama.id, drama.source, nextIndex);
+    window.scrollTo(0, 0);
+    return Promise.resolve(true);
+  }
+  state.route = 0;
+  flushProgress();
+  showNotice('正在加载下一集…');
+  return apiPlay({
+    drama: drama,
+    chapter: chapters[nextIndex],
+    index: nextIndex,
+    quality: state.quality || 0,
+    route: 0,
+  })
+    .then(function (plan) {
+      if (!document.body.contains(video)) {
+        return false;
+      }
+      state.index = nextIndex;
+      state.plan = plan;
+      resetRouteTried(plan.routeIndex || 0, plan.routeCount || 1);
+      var note = document.getElementById('play-note');
+      if (note) {
+        note.textContent = '';
+        note.style.display = 'none';
+      }
+      syncEpisodeChrome(nextIndex);
+      mountVideo(plan.url, 0);
+      libraryRequest({ list: 'history', op: 'put', item: currentEntry(0, 0) }).catch(function () {});
+      return true;
+    })
+    .catch(function (error) {
+      showNotice(error.message || '下一集加载失败，请手动点“下一集”重试。');
+      return false;
+    });
+}
+
+// 上一集：和下一集一样就地换集，复用同一个 <video>，倍速与全屏都不丢。
+function playPreviousEpisode() {
+  var drama = state.drama;
+  var chapters = state.chapters || [];
+  var prevIndex = state.index - 1;
+  var video = document.getElementById('player');
+  if (!drama || prevIndex < 0) {
+    return Promise.resolve(false);
+  }
+  cancelAutoNext();
+  if (!video) {
+    location.hash = episodeHash(drama.id, drama.source, prevIndex);
+    window.scrollTo(0, 0);
+    return Promise.resolve(true);
+  }
+  state.route = 0;
+  flushProgress();
+  showNotice('正在加载上一集…');
+  return apiPlay({
+    drama: drama,
+    chapter: chapters[prevIndex],
+    index: prevIndex,
+    quality: state.quality || 0,
+    route: 0,
+  })
+    .then(function (plan) {
+      if (!document.body.contains(video)) {
+        return false;
+      }
+      state.index = prevIndex;
+      state.plan = plan;
+      resetRouteTried(plan.routeIndex || 0, plan.routeCount || 1);
+      var note = document.getElementById('play-note');
+      if (note) {
+        note.textContent = '';
+        note.style.display = 'none';
+      }
+      syncEpisodeChrome(prevIndex);
+      mountVideo(plan.url, 0);
+      libraryRequest({ list: 'history', op: 'put', item: currentEntry(0, 0) }).catch(function () {});
+      return true;
+    })
+    .catch(function (error) {
+      showNotice(error.message || '上一集加载失败，请手动点“上一集”重试。');
+      return false;
+    });
+}
+
+// 本集播完直接进下一集；已是最后一集或开关关闭时只做提示。
+function scheduleAutoNext() {
+  var chapters = state.chapters || [];
+  var nextIndex = state.index + 1;
+  if (!state.drama || nextIndex >= chapters.length) {
+    showNotice('已经是最后一集了。');
+    return;
+  }
+  if (!state.autoNext) {
+    return;
+  }
+  playNextEpisode();
+}
+
+function fitVideo(video) {
+  var width = video.videoWidth;
+  var height = video.videoHeight;
+  if (!width || !height) {
+    return;
+  }
+  // 竖屏短剧很常见，按真实比例收窄并居中，画面最大化又不超出屏幕。
+  if (height > width) {
+    video.classList.add('portrait');
+    video.style.setProperty('--ratio', String(width / height));
+  } else {
+    video.classList.remove('portrait');
+    video.style.removeProperty('--ratio');
+  }
+}
+
+function stopPlayback() {
+  cancelAutoNext();
+  flushProgress();
+  if (hlsInstance) {
+    hlsInstance.destroy();
+    hlsInstance = null;
+  }
+  state.plan = null;
+}
+
+function apiPlay(payload) {
+  if (payload && payload.adBlock === undefined) {
+    payload.adBlock = state.adBlock;
+  }
+  return fetch('/api/play', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+    .then(function (response) {
+      return response.json();
+    })
+    .then(function (data) {
+      if (!data.ok) {
+        throw new Error(data.error || '解析播放地址失败');
+      }
+      return data.data;
+    });
+}
+
+// 红果等站源的视频是加密的 H.265，浏览器既不能解密也不能解码，
+// 只能由服务端用 ffmpeg 解密重编码后再播。
+var FFMPEG_HINT =
+  '这一集是加密的 H.265 视频，浏览器无法直接播放，需要服务端转码。' +
+  '请先安装 ffmpeg（Windows：winget install ffmpeg；macOS：brew install ffmpeg），' +
+  '放到本程序同一个目录或加入 PATH，然后重启本地服务。';
+
+var HEVC_NOTICE =
+  '该视频采用 H.265/HEVC 编码，当前浏览器无法解码。' +
+  '建议改用 Safari / Edge；Windows 用户可在「设置 → 应用 → 可选功能」安装' +
+  '「HEVC 视频扩展」后重试。';
+
+function showNotice(message, kind) {
+  var box = document.getElementById('play-note');
+  if (!box) {
+    return;
+  }
+  box.setAttribute('data-kind', kind || '');
+  box.textContent = message;
+  box.style.display = 'block';
+}
+
+function applyPlaybackRate(video) {
+  if (!video || !(playbackRate > 0)) {
+    return;
+  }
+  try {
+    if (video.playbackRate !== playbackRate) {
+      video.playbackRate = playbackRate;
+    }
+  } catch (error) {
+    // 个别浏览器在加载初期不允许改倍速，loadedmetadata 时会再试一次。
+  }
+}
+
+function rememberPlaybackRate(value) {
+  if (!(value > 0)) {
+    return;
+  }
+  playbackRate = value;
+  writePlaybackRate(value);
+}
+
+// 播放器事件只绑一次：就地换集复用同一个 <video>，避免监听器叠加。
+function bindPlayerEvents(video) {
+  video.addEventListener('ratechange', function () {
+    rememberPlaybackRate(video.playbackRate);
+  });
+  video.addEventListener('playing', function () {
+    // 线路已被证明能正常出画面：撤销"原线路重试"的消耗，
+    // 之后偶发一次网络抖动还能再享受一次宽容，而不是直接换线。
+    if (video.videoWidth > 0 && sameLineRetried) {
+      if (sameLineRetryTimer) {
+        clearTimeout(sameLineRetryTimer);
+        sameLineRetryTimer = null;
+      }
+      sameLineRetried = false;
+    }
+    var box = document.getElementById('play-note');
+    if (box && (box.getAttribute('data-kind') === 'transcode' ||
+      box.getAttribute('data-kind') === 'switching')) {
+      box.style.display = 'none';
+    }
+  });
+  video.addEventListener('loadedmetadata', function () {
+    fitVideo(video);
+    applyPlaybackRate(video);
+  });
+  video.addEventListener('timeupdate', function () {
+    reportProgress(false);
+  });
+  video.addEventListener('pause', function () {
+    reportProgress(true);
+  });
+  video.addEventListener('ended', function () {
+    reportProgress(true);
+    scheduleAutoNext();
+  });
+}
+
+// 整页重建前记下倍速与全屏状态，重建后好还原。
+function capturePlaybackState() {
+  var video = document.getElementById('player');
+  if (video) {
+    rememberPlaybackRate(video.playbackRate);
+  }
+  resumeFullscreen =
+    !!video &&
+    (document.fullscreenElement === video || document.webkitFullscreenElement === video);
+}
+
+// 只有用户手势里才可能重新进全屏（点“下一集”链接属于这种情况）；
+// 自动连播走的是就地换集，元素压根没换，不需要这里恢复。
+function restoreFullscreen() {
+  if (!resumeFullscreen) {
+    return;
+  }
+  resumeFullscreen = false;
+  var video = document.getElementById('player');
+  if (!video) {
+    return;
+  }
+  var request =
+    video.requestFullscreen || video.webkitRequestFullscreen || video.webkitEnterFullscreen;
+  if (!request) {
+    return;
+  }
+  try {
+    var result = request.call(video);
+    if (result && typeof result.catch === 'function') {
+      result.catch(function () {});
+    }
+  } catch (error) {
+    // 没有用户手势时浏览器会拒绝，保持非全屏即可。
+  }
+}
+
+// 黑屏看门狗：部分线路的 TS 把 H.265 藏在私有流（PMT stream_type=0x06）里，
+// 浏览器 MSE 认不出可解码的视频轨，表现为"进度条在走、画面全黑"。
+// 检测到时间推进但 videoWidth 始终为 0 时，同样走自动换线。
+function startBlackScreenWatchdog(video, token) {
+  var lastTime = -1;
+  var advancing = 0;
+  var timer = setInterval(function () {
+    if (token !== mountToken) {
+      clearInterval(timer);
+      return;
+    }
+    if (video.videoWidth > 0) {
+      clearInterval(timer); // 画面已出来，看门狗使命完成
+      return;
+    }
+    if (video.paused || video.seeking) {
+      // 暂停、拖动期间时间轴本来就不动，不作判定依据
+      advancing = 0;
+      lastTime = video.currentTime;
+      return;
+    }
+    if (video.currentTime > lastTime + 1) {
+      advancing += 1;
+    } else {
+      advancing = 0;
+    }
+    lastTime = video.currentTime;
+    if (advancing >= 6) {
+      clearInterval(timer);
+      showNotice('该线路画面无法解码（可能是浏览器不支持的视频编码），正在自动切换线路…', 'switching');
+      // 编码不兼容是确定性故障，原线路重试也不会变，直接换线
+      failoverRoute('视频编码不支持', true);
+    }
+  }, 4000);
+  if (blackWatchdog) {
+    clearInterval(blackWatchdog);
+  }
+  blackWatchdog = timer;
+}
+
+function mountVideo(url, resumeAt) {
+  var video = document.getElementById('player');
+  if (!video) {
+    return;
+  }
+  if (hlsInstance) {
+    hlsInstance.destroy();
+    hlsInstance = null;
+  }
+  if (!video.dataset.bound) {
+    video.dataset.bound = '1';
+    bindPlayerEvents(video);
+  }
+  var token = ++mountToken;
+  // 每次新建播放（首次播放 / 换集 / 换画质 / 换到某条新线路）都视为"全新尝试"，
+  // 给这条线路重新享有一次原线路重试的宽容预算。
+  lastMountUrl = url;
+  sameLineRetried = false;
+  if (sameLineRetryTimer) {
+    clearTimeout(sameLineRetryTimer);
+    sameLineRetryTimer = null;
+  }
+  video.onerror = function () {
+    cancelAutoNext();
+    // 加载失败先走"原线路重试"，重试仍失败才换线（failoverRoute 内部两层）。
+    failoverRoute('视频加载失败');
+  };
+  var isPlaylist = /\.m3u8($|\?)/i.test(url);
+  var mediaRecoveries = 0;
+  if (isPlaylist && window.Hls && window.Hls.isSupported()) {
+    hlsInstance = new window.Hls({
+      enableWorker: true,
+      manifestLoadPolicy: {
+        default: {
+          maxTimeToFirstByteMs: 60000,
+          maxLoadTimeMs: 120000,
+          // 清单加载先自行重试几轮，抗住瞬时抖动；连续失败到顶才判死换线。
+          timeoutRetry: { maxNumRetry: 3, retryDelayMs: 1000, maxRetryDelayMs: 4000, backoff: 'linear' },
+          errorRetry: { maxNumRetry: 3, retryDelayMs: 1000, maxRetryDelayMs: 4000, backoff: 'linear' },
+        },
+      },
+    });
+    hlsInstance.on(window.Hls.Events.ERROR, function (event, data) {
+      if (!data || !data.fatal) {
+        return;
+      }
+      if (token !== mountToken) {
+        return; // 旧实例的迟到回调，忽略
+      }
+      // 播放追上转码进度时会缓冲停滞，这属于正常现象，恢复播放等转码跟上即可。
+      if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveries < 4) {
+        mediaRecoveries += 1;
+        showNotice('缓冲中…服务端转码需要一点时间，会自动继续播放。', 'transcode');
+        hlsInstance.recoverMediaError();
+        return;
+      }
+      // 致命网络错误（含 manifestLoadError）或已耗尽媒体恢复次数：自动切换线路。
+      var reason = data.details || data.type || '未知错误';
+      if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR) {
+        reason = '画面解码失败';
+      }
+      failoverRoute(reason);
+    });
+    hlsInstance.loadSource(url);
+    hlsInstance.attachMedia(video);
+  } else {
+    video.src = url;
+  }
+  applyPlaybackRate(video);
+  video.play().catch(function (error) {
+    // 浏览器可能因为自动播放策略拦截首次播放，提示用户手动点一下。
+    if (error && error.name === 'NotAllowedError') {
+      showNotice('浏览器阻止了自动播放，请点击播放按钮开始。');
+    }
+  });
+  // 续播：有播放记录时跳回上次看到的位置。
+  if (resumeAt > 0) {
+    video.addEventListener(
+      'loadedmetadata',
+      function () {
+        if (token !== mountToken) {
+          return;
+        }
+        if (video.duration && resumeAt > video.duration - 5) {
+          return;
+        }
+        try {
+          video.currentTime = resumeAt;
+          showNotice('已从上次进度 ' + formatTime(resumeAt) + ' 继续播放。', 'resume');
+          // 播放真正开始由 playing 事件清掉它；万一用户一直不点播放，5 秒后也自动收起。
+          setTimeout(function () {
+            if (token !== mountToken) {
+              return;
+            }
+            var box = document.getElementById('play-note');
+            if (box && box.getAttribute('data-kind') === 'resume') {
+              box.style.display = 'none';
+            }
+          }, 5000);
+        } catch (error) {
+          // 部分流不允许跳转，忽略即可。
+        }
+      },
+      { once: true },
+    );
+  }
+  // 浏览器拿不到视频帧但时间在走（HEVC/私有流），9 秒内自动换线。
+  startBlackScreenWatchdog(video, token);
+}
+
+function optionHTML(value, label, selected) {
+  return (
+    '<option value="' + escapeHTML(String(value)) + '"' + (selected ? ' selected' : '') + '>' +
+    escapeHTML(label) +
+    '</option>'
+  );
+}
+
+function renderPlay(id, index, source) {
+  // 整页重建会换掉 <video>，先把倍速和全屏状态记下来。
+  capturePlaybackState();
+  flushProgress();
+  view.innerHTML = '<div class="loading">正在解析播放地址…</div>';
+  state.index = index;
+  return ensureDrama(id, source)
+    .then(function () {
+      return apiPlay({
+        drama: state.drama,
+        chapter: (state.chapters || [])[index],
+        index: index,
+        quality: state.quality || 0,
+        route: state.route || 0,
+      });
+    })
+    .then(function (plan) {
+      state.plan = plan;
+      resetRouteTried(plan.routeIndex || 0, plan.routeCount || 1);
+      var qualities = plan.qualities || [];
+      var current = plan.quality || 0;
+      if (qualities.indexOf(current) === -1 && qualities.length) {
+        current = qualities[0];
+      }
+      var qualitySelect = qualities.length
+        ? '<label>画质 <select id="quality-select">' +
+          qualities
+            .map(function (item) {
+              return optionHTML(item, item + 'P', item === current);
+            })
+            .join('') +
+          '</select></label>'
+        : '';
+      var routeTotal = plan.routeCount || 1;
+      var routeSelect =
+        '<label>线路 <select id="route-select">' +
+        Array.apply(null, new Array(routeTotal))
+          .map(function (unused, position) {
+            return optionHTML(position, '线路 ' + (position + 1) + '/' + routeTotal, position === (plan.routeIndex || 0));
+          })
+          .join('') +
+        '</select></label>';
+      var suffix = (state.drama.source ? '&source=' + encodeURIComponent(state.drama.source) : '');
+      var hasNextEp = index + 1 < (state.chapters || []).length;
+      var hasPrevEp = index > 0;
+      // 用按钮而不是超链接：点击走就地换集（playNextEpisode / playPreviousEpisode），
+      // 复用同一个 <video>，倍速和全屏都不会被重置。
+      var next = hasNextEp
+        ? '<button type="button" class="btn" id="episode-next">下一集</button>'
+        : '';
+      var previous = hasPrevEp
+        ? '<button type="button" class="btn" id="episode-previous">上一集</button>'
+        : '';
+      var favorite = isFavorite(state.drama)
+        ? '<button type="button" class="btn active" id="fav-toggle">已收藏</button>'
+        : '<button type="button" class="btn" id="fav-toggle">收藏</button>';
+      var hasNext = index + 1 < (state.chapters || []).length;
+      var autoNextBox = hasNext
+        ? '<label class="toggle" title="播完自动跳到下一集">' +
+          '<input type="checkbox" id="auto-next"' + (state.autoNext ? ' checked' : '') + '>自动连播</label>'
+        : '';
+      var adBlockBox = '<label class="toggle" title="播放前清洗 m3u8，剔除插播在时间线里的广告分片；关闭后加载原画">' +
+        '<input type="checkbox" id="ad-block"' + (state.adBlock ? ' checked' : '') + '>去广告</label>';
+      var message = '';
+      var kind = '';
+      if (plan.message === '需要 ffmpeg 转码' || (plan.mode === 'direct' && plan.encrypted)) {
+        message = FFMPEG_HINT;
+      } else if (plan.mode === 'direct' && plan.hevc) {
+        message = HEVC_NOTICE;
+      } else if (plan.transcoding) {
+        message = '服务端正在转码，首次缓冲可能需要十几秒…';
+        kind = 'transcode';
+      } else if (plan.message) {
+        message = plan.message;
+      }
+      view.innerHTML =
+        '<div class="player-wrap">' +
+        '<div class="player-title">' +
+        escapeHTML(state.drama.title) + ' · ' + escapeHTML(((state.chapters || [])[index] || {}).title || '') +
+        '</div>' +
+        '<video id="player" controls autoplay playsinline></video>' +
+        '<div class="notice" id="play-note" data-kind="' + kind + '"' +
+        (message ? ' style="display:block"' : '') + '>' +
+        escapeHTML(message) +
+        '</div>' +
+        '<div class="notice next-up" id="next-up"></div>' +
+        '<div class="player-bar">' + qualitySelect + routeSelect +
+        '<span class="spacer"></span>' +
+        adBlockBox +
+        autoNextBox +
+        '<a class="btn" href="#/drama?id=' + encodeURIComponent(id) + suffix + '">返回详情</a>' +
+        favorite +
+        previous +
+        next +
+        '</div></div>';
+      var resumeAt = 0;
+      var remembered = findEntry(state.library.history, entryKey(state.drama), index);
+      if (remembered && remembered.position > 5) {
+        resumeAt = remembered.position;
+      }
+      mountVideo(plan.url, resumeAt);
+      bindFavoriteToggle(state.drama);
+      // 打开播放页就先记一条播放记录，之后的进度由播放器持续更新。
+      libraryRequest({ list: 'history', op: 'put', item: currentEntry(resumeAt, 0) }).catch(function () {});
+      var qualityBox = document.getElementById('quality-select');
+      if (qualityBox) {
+        qualityBox.addEventListener('change', function () {
+          state.quality = Number(qualityBox.value);
+          state.route = 0;
+          renderPlay(id, index, source);
+        });
+      }
+      var routeBox = document.getElementById('route-select');
+      if (routeBox) {
+        routeBox.addEventListener('change', function () {
+          state.route = Number(routeBox.value);
+          renderPlay(id, index, source);
+        });
+      }
+      var autoNextToggle = document.getElementById('auto-next');
+      if (autoNextToggle) {
+        autoNextToggle.addEventListener('change', function () {
+          state.autoNext = autoNextToggle.checked;
+          writeAutoNext(state.autoNext);
+          if (!state.autoNext) {
+            cancelAutoNext();
+          }
+        });
+      }
+      var adBlockToggle = document.getElementById('ad-block');
+      if (adBlockToggle) {
+        adBlockToggle.addEventListener('change', function () {
+          state.adBlock = adBlockToggle.checked;
+          writeAdBlock(state.adBlock);
+          // 重新解析当前集让开关立即生效（核心按新会话清洗或放行原画）。
+          flushProgress();
+          renderPlay(id, index, source);
+        });
+      }
+      var nextButton = document.getElementById('episode-next');
+      if (nextButton) {
+        nextButton.addEventListener('click', function () {
+          playNextEpisode();
+        });
+      }
+      var previousButton = document.getElementById('episode-previous');
+      if (previousButton) {
+        previousButton.addEventListener('click', function () {
+          playPreviousEpisode();
+        });
+      }
+      // 整页重建（换画质/线路）后，若进入本页前处于全屏，重新进全屏。
+      // 就地换集（下一集/上一集/自动连播）不会走这里，全屏由 <video> 保留。
+      restoreFullscreen();
+    });
+}
+
+function libraryCardHTML(entry, tab) {
+  var key = entryKey(entry);
+  var suffix = entry.source ? '&source=' + encodeURIComponent(entry.source) : '';
+  var href = tab === 'history'
+    ? '#/play?id=' + encodeURIComponent(entry.id) + '&index=' + Number(entry.index || 0) + suffix
+    : '#/drama?id=' + encodeURIComponent(entry.id) + suffix;
+  var second = tab === 'history'
+    ? progressText(entry)
+    : (entry.episodes ? entry.episodes + ' 集' : '点击查看剧集');
+  var bar = tab === 'history'
+    ? '<div class="progress"><span style="width:' + progressPercent(entry) + '%"></span></div>'
+    : '';
+  var checked = state.libraryEditing && state.librarySelected[key] ? ' checked' : '';
+  var check = state.libraryEditing
+    ? '<label class="lib-check"><input type="checkbox" data-check="' +
+      escapeHTML(key) + '"' + checked + ' /></label>'
+    : '';
+  return (
+    '<div class="card lib-card">' +
+    check +
+    '<button type="button" class="lib-remove" data-remove="' + escapeHTML(key) + '" title="删除">×</button>' +
+    '<a class="lib-link" href="' + escapeHTML(href) + '">' +
+    coverHTML(entry) +
+    '<div class="title">' + escapeHTML(entry.title || '未命名') + '</div>' +
+    '<div class="meta">' + escapeHTML(entry.sourceName || sourceLabel(entry.source) || '未知站源') + '</div>' +
+    '<div class="meta">' + escapeHTML(second) + '</div>' +
+    bar +
+    '</a></div>'
+  );
+}
+
+function renderFavoritesView() {
+  var tab = state.libraryTab === 'favorites' ? 'favorites' : 'history';
+  var items = tab === 'history' ? state.library.history : state.library.favorites;
+  var selectedKeys = Object.keys(state.librarySelected).filter(function (key) {
+    return state.librarySelected[key];
+  });
+  var toolbar = state.libraryEditing
+    ? '<div class="lib-toolbar">' +
+      '<label class="lib-all"><input type="checkbox" id="lib-all"' +
+      (selectedKeys.length && selectedKeys.length === items.length ? ' checked' : '') +
+      ' /> 全选</label>' +
+      '<button type="button" class="btn" id="lib-delete">删除选中（' + selectedKeys.length + '）</button>' +
+      '<button type="button" class="btn danger" id="lib-clear">清空全部</button>' +
+      '<button type="button" class="btn" id="lib-done">完成</button>' +
+      '</div>'
+    : '';
+  var cards = items.map(function (entry) {
+    return libraryCardHTML(entry, tab);
+  }).join('');
+  if (!cards) {
+    cards = '<div class="empty">' +
+      (tab === 'history' ? '还没有播放记录，看过的剧会自动出现在这里。' : '还没有收藏，可在播放页点「收藏」加入。') +
+      '</div>';
+  }
+  var editButton = items.length
+    ? '<button type="button" class="btn" id="lib-edit">' + (state.libraryEditing ? '退出编辑' : '编辑') + '</button>'
+    : '';
+  view.innerHTML =
+    '<div class="lib">' +
+    '<div class="lib-tabs">' +
+    '<button type="button" class="lib-tab' + (tab === 'history' ? ' active' : '') +
+    '" data-tab="history">播放记录（' + state.library.history.length + '）</button>' +
+    '<button type="button" class="lib-tab' + (tab === 'favorites' ? ' active' : '') +
+    '" data-tab="favorites">收藏（' + state.library.favorites.length + '）</button>' +
+    '<span class="spacer"></span>' + editButton +
+    '</div>' +
+    toolbar +
+    '<div class="grid">' + cards + '</div>' +
+    '</div>';
+  bindLibraryView();
+}
+
+function libraryMutate(list, op, keys) {
+  return libraryRequest({ list: list, op: op, keys: keys || [] }).then(function () {
+    state.librarySelected = {};
+    renderFavoritesView();
+  });
+}
+
+function bindLibraryView() {
+  var tabs = document.querySelectorAll('.lib-tab');
+  Array.prototype.forEach.call(tabs, function (button) {
+    button.addEventListener('click', function () {
+      state.libraryTab = button.getAttribute('data-tab');
+      state.librarySelected = {};
+      renderFavoritesView();
+    });
+  });
+  var editButton = document.getElementById('lib-edit');
+  if (editButton) {
+    editButton.addEventListener('click', function () {
+      state.libraryEditing = !state.libraryEditing;
+      state.librarySelected = {};
+      renderFavoritesView();
+    });
+  }
+  var doneButton = document.getElementById('lib-done');
+  if (doneButton) {
+    doneButton.addEventListener('click', function () {
+      state.libraryEditing = false;
+      state.librarySelected = {};
+      renderFavoritesView();
+    });
+  }
+  var allBox = document.getElementById('lib-all');
+  if (allBox) {
+    allBox.addEventListener('change', function () {
+      var list = state.libraryTab === 'favorites' ? state.library.favorites : state.library.history;
+      state.librarySelected = {};
+      if (allBox.checked) {
+        list.forEach(function (entry) {
+          state.librarySelected[entryKey(entry)] = true;
+        });
+      }
+      renderFavoritesView();
+    });
+  }
+  Array.prototype.forEach.call(document.querySelectorAll('[data-check]'), function (box) {
+    box.addEventListener('change', function () {
+      state.librarySelected[box.getAttribute('data-check')] = box.checked;
+      renderFavoritesView();
+    });
+  });
+  Array.prototype.forEach.call(document.querySelectorAll('[data-remove]'), function (button) {
+    button.addEventListener('click', function (event) {
+      event.preventDefault();
+      libraryMutate(state.libraryTab, 'remove', [button.getAttribute('data-remove')]);
+    });
+  });
+  var deleteButton = document.getElementById('lib-delete');
+  if (deleteButton) {
+    deleteButton.addEventListener('click', function () {
+      var keys = Object.keys(state.librarySelected).filter(function (key) {
+        return state.librarySelected[key];
+      });
+      if (!keys.length) {
+        return;
+      }
+      libraryMutate(state.libraryTab, 'remove', keys);
+    });
+  }
+  var clearButton = document.getElementById('lib-clear');
+  if (clearButton) {
+    clearButton.addEventListener('click', function () {
+      var label = state.libraryTab === 'history' ? '播放记录' : '收藏';
+      if (!window.confirm('确定清空全部' + label + '？此操作不可撤销。')) {
+        return;
+      }
+      libraryMutate(state.libraryTab, 'clear', []);
+    });
+  }
+}
+
+function renderFavorites(tab) {
+  if (tab) {
+    state.libraryTab = tab;
+  }
+  view.innerHTML = '<div class="loading">正在加载收藏夹…</div>';
+  return loadLibrary().then(function () {
+    renderFavoritesView();
+  });
+}
+
+// —— 自定义 maccms 源管理 ——
+
+function customSourceList() {
+  return fetch('/api/custom-sources')
+    .then(function (response) {
+      return response.json();
+    })
+    .then(function (data) {
+      return (data && data.items) || [];
+    });
+}
+
+function customSourceSave(record, editing) {
+  return fetch('/api/custom-sources' + (editing ? '/' + encodeURIComponent(record.id) : ''), {
+    method: editing ? 'PUT' : 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: record.name, base: record.base, rule: record.rule || '' }),
+  }).then(function (response) {
+    return response.json().then(function (data) {
+      if (!data || !data.id) {
+        throw new Error(data && data.error ? data.error : '保存自定义源失败');
+      }
+      return data;
+    });
+  });
+}
+
+function customSourceImportText(content) {
+  return fetch('/api/custom-sources/import', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content: content }),
+  }).then(function (response) {
+    return response.json().then(function (data) {
+      if (!data || data.ok !== true) {
+        throw new Error(data && data.error ? data.error : '导入自定义源失败');
+      }
+      return data.result || {};
+    });
+  });
+}
+
+function customSourceImportUrl(url) {
+  return fetch('/api/custom-sources/import', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url: url }),
+  }).then(function (response) {
+    return response.json().then(function (data) {
+      if (!data || data.ok !== true) {
+        throw new Error(data && data.error ? data.error : '导入远程配置失败');
+      }
+      return data.result || {};
+    });
+  });
+}
+
+function customSourceResetAll() {
+  return fetch('/api/custom-sources/reset', { method: 'POST' })
+    .then(function (response) {
+      return response.json();
+    })
+    .then(function (data) {
+      if (!data || data.ok !== true) {
+        throw new Error(data && data.error ? data.error : '恢复默认源失败');
+      }
+      return data.removed || 0;
+    });
+}
+
+function afterCustomSourcesChanged(result) {
+  return Promise.all([customSourceList(), loadSources()]).then(function (listResults) {
+    state.sourceNames = {};
+    (listResults[0] || []).forEach(function (item) {
+      state.sourceNames[item.id] = item.name;
+    });
+    renderCustomSources();
+    if (result) {
+      var added = (result.added || []).length;
+      var updated = (result.updated || []).length;
+      var notes = [].concat(result.skipped || [], result.failed || []);
+      var message = '导入完成：新增 ' + added + ' 个，更新 ' + updated + ' 个。';
+      if (notes.length) {
+        message += '\n' + notes.join('\n');
+      }
+      window.alert(message);
+    }
+    return listResults;
+  });
+}
+
+function customSourceRemove(id) {
+  return fetch('/api/custom-sources/' + encodeURIComponent(id), { method: 'DELETE' })
+    .then(function (response) {
+      return response.json();
+    })
+    .then(function (data) {
+      if (!data || data.ok !== true) {
+        throw new Error(data && data.error ? data.error : '删除自定义源失败');
+      }
+      return data;
+    });
+}
+
+// —— 源显示列表管理 ——
+
+function visibilityList() {
+  return fetch('/api/source-visibility')
+    .then(function (response) {
+      return response.json();
+    })
+    .then(function (data) {
+      return (data && data.items) || [];
+    });
+}
+
+function visibilitySet(id, visible) {
+  return fetch('/api/source-visibility', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: id, visible: !!visible }),
+  }).then(function (response) {
+    return response.json().then(function (data) {
+      if (!data || data.ok !== true) {
+        throw new Error(data && data.error ? data.error : '保存源显示设置失败');
+      }
+      return data;
+    });
+  });
+}
+
+function renderSourceVisibility() {
+  view.innerHTML = '<div class="loading">正在加载站源列表…</div>';
+  return visibilityList().then(function (items) {
+    var visibleCount = items.filter(function (item) { return item.visible; }).length;
+    var rows = items.map(function (item) {
+      return (
+        '<div class="vis-row" style="display:flex;align-items:center;justify-content:space-between;border:1px solid var(--border);border-radius:8px;padding:10px 14px;margin:6px 0">' +
+        '<div style="min-width:0">' +
+        '<div style="font-weight:600">' + escapeHTML(item.name || '') +
+        (item.builtin ? '（内置）' : '（自定义）') + '</div>' +
+        '<div style="font-size:12px;opacity:0.6">' + escapeHTML(item.id) + '</div>' +
+        '</div>' +
+        '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;flex:none">' +
+        '<span style="font-size:13px;opacity:0.8">' + (item.visible ? '首页显示' : '已隐藏') + '</span>' +
+        '<input type="checkbox" class="vis-toggle" data-id="' + escapeHTML(item.id) + '"' +
+        (item.visible ? ' checked' : '') + ' />' +
+        '</label>' +
+        '</div>'
+      );
+    }).join('');
+    if (!rows) {
+      rows = '<div class="empty">当前没有可用站源。</div>';
+    }
+    view.innerHTML =
+      '<div class="lib">' +
+      '<div class="lib-tabs">' +
+      '<span class="lib-tab active">源显示列表（可见 ' + visibleCount + ' / 共 ' + items.length + '）</span>' +
+      '</div>' +
+      '<div style="font-size:12px;opacity:0.7;padding:4px 2px 8px">' +
+      '关闭的站源不会出现在顶部站源下拉框与首页目录中；自定义源记录、已缓存内容与播放都不受影响，随时可以重新开启。</div>' +
+      rows +
+      '</div>';
+    bindSourceVisibilityView();
+  });
+}
+
+function bindSourceVisibilityView() {
+  var toggles = view.querySelectorAll('.vis-toggle');
+  Array.prototype.forEach.call(toggles, function (input) {
+    input.addEventListener('change', function () {
+      input.disabled = true;
+      visibilitySet(input.getAttribute('data-id'), input.checked).then(function () {
+        // 下拉框同步刷新：当前源被隐藏时 loadSources 会自动落到首个可见源。
+        return loadSources();
+      }).then(function () {
+        renderSourceVisibility();
+      }).catch(function (error) {
+        input.disabled = false;
+        window.alert(error.message || '保存源显示设置失败');
+      });
+    });
+  });
+}
+
+function renderCustomSources() {
+  return customSourceList().then(function (items) {
+    var rows = items.map(function (item) {
+      return (
+        '<div class="lib-tab custom-row" style="display:flex;align-items:center;justify-content:space-between;border:1px solid var(--border);border-radius:8px;padding:10px 14px;margin:6px 0;cursor:default">' +
+        '<div style="min-width:0">' +
+        '<div style="font-weight:600">' + escapeHTML(item.name || '') + (item.rule ? '（规则）' : '') + '</div>' +
+        '<div style="font-size:12px;opacity:0.7;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
+        escapeHTML(item.base || '') + '</div>' +
+        '</div>' +
+        '<div style="display:flex;gap:6px;flex:none">' +
+        '<button type="button" class="btn" data-edit="' + escapeHTML(item.id) + '">编辑</button>' +
+        '<button type="button" class="btn danger" data-remove="' + escapeHTML(item.id) + '" data-name="' +
+        escapeHTML(item.name || '') + '">删除</button>' +
+        '</div>' +
+        '</div>'
+      );
+    }).join('');
+    if (!rows) {
+      rows = '<div class="empty">还没有自定义源。填入符合 MacCMS 规范的站点名称与网址，或粘贴 XBPQ 爬虫规则；也可以导入 JSON/TXT 文件批量添加。</div>';
+    }
+    view.innerHTML =
+      '<div class="lib">' +
+      '<div class="lib-tabs">' +
+      '<span class="lib-tab active">自定义源（' + items.length + '）</span>' +
+      '<span class="spacer"></span>' +
+      '<input type="file" id="custom-import-file" accept=".json,.txt,application/json,text/plain" style="display:none" />' +
+      '<button type="button" class="btn" id="custom-import">导入文件</button>' +
+      '<button type="button" class="btn" id="custom-import-url">导入网络地址</button>' +
+      '<button type="button" class="btn" id="custom-export">导出 JSON</button>' +
+      '<button type="button" class="btn danger" id="custom-reset">恢复默认源</button>' +
+      '<button type="button" class="btn" id="custom-add">新增</button>' +
+      '</div>' +
+      '<div style="font-size:12px;opacity:0.7;padding:4px 2px 8px">' +
+      '自定义源读取网址并判断是否符合 MacCMS 规范；符合后套用通用规则自动完成列表、搜索与播放。粘贴 XBPQ 规则时按规则字段逐项截取。</div>' +
+      rows +
+      '</div>';
+    bindCustomSourcesView(items);
+  });
+}
+
+function bindCustomSourcesView(items) {
+  var addButton = document.getElementById('custom-add');
+  if (addButton) {
+    addButton.addEventListener('click', function () {
+      openCustomSourceEditor(null);
+    });
+  }
+  var exportButton = document.getElementById('custom-export');
+  if (exportButton) {
+    exportButton.addEventListener('click', function () {
+      exportButton.disabled = true;
+      fetch('/api/custom-sources/export')
+        .then(function (response) {
+          if (!response.ok) {
+            throw new Error('导出失败');
+          }
+          return response.text();
+        })
+        .then(function (text) {
+          if (!text || text.charAt(0) === '{' && JSON.parse(text).ok === false) {
+            var parsed = {};
+            try { parsed = JSON.parse(text); } catch (e) {}
+            throw new Error(parsed.error || '导出失败');
+          }
+          var blob = new Blob([text], { type: 'application/json' });
+          var link = document.createElement('a');
+          link.href = URL.createObjectURL(blob);
+          link.download = 'duanju-custom-sources.json';
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+          setTimeout(function () { URL.revokeObjectURL(link.href); }, 1000);
+        })
+        .catch(function (error) {
+          window.alert(error.message || '导出自定义源失败');
+        })
+        .then(function () {
+          exportButton.disabled = false;
+        });
+    });
+  }
+  var importButton = document.getElementById('custom-import');
+  var importInput = document.getElementById('custom-import-file');
+  if (importButton && importInput) {
+    importButton.addEventListener('click', function () {
+      importInput.value = '';
+      importInput.click();
+    });
+    importInput.addEventListener('change', function () {
+      var file = importInput.files && importInput.files[0];
+      if (!file) {
+        return;
+      }
+      if (file.size > 8 * 1024 * 1024) {
+        window.alert('导入文件过大（上限 8MB）');
+        return;
+      }
+      var reader = new FileReader();
+      reader.onload = function () {
+        importButton.disabled = true;
+        customSourceImportText(String(reader.result || ''))
+          .then(function (result) {
+            return afterCustomSourcesChanged(result);
+          })
+          .catch(function (error) {
+            window.alert(error.message || '导入自定义源失败');
+          })
+          .then(function () {
+            importButton.disabled = false;
+          });
+      };
+      reader.readAsText(file, 'utf-8');
+    });
+  }
+  var importUrlButton = document.getElementById('custom-import-url');
+  if (importUrlButton) {
+    importUrlButton.addEventListener('click', function () {
+      openCustomSourceImportUrlDialog();
+    });
+  }
+  var resetButton = document.getElementById('custom-reset');
+  if (resetButton) {
+    resetButton.addEventListener('click', function () {
+      var confirmed = window.confirm('将删除全部自定义源（含 XBPQ 规则），仅保留内置源。此操作不可撤销，建议先「导出 JSON」备份。\n\n确定恢复默认吗？');
+      if (!confirmed) {
+        return;
+      }
+      resetButton.disabled = true;
+      customSourceResetAll()
+        .then(function (removed) {
+          return afterCustomSourcesChanged(null).then(function () {
+            window.alert('已删除 ' + removed + ' 个自定义源，恢复为默认内置源。');
+          });
+        })
+        .catch(function (error) {
+          window.alert(error.message || '恢复默认源失败');
+        })
+        .then(function () {
+          resetButton.disabled = false;
+        });
+    });
+  }
+  Array.prototype.forEach.call(view.querySelectorAll('[data-edit]'), function (button) {
+    button.addEventListener('click', function () {
+      var id = button.getAttribute('data-edit');
+      var item = items.filter(function (entry) { return entry.id === id; })[0];
+      if (item) {
+        openCustomSourceEditor(item);
+      }
+    });
+  });
+  Array.prototype.forEach.call(view.querySelectorAll('[data-remove]'), function (button) {
+    button.addEventListener('click', function () {
+      var id = button.getAttribute('data-remove');
+      var name = button.getAttribute('data-name') || '';
+      var confirmed = window.confirm('确定删除「' + name + '」吗？已加载的剧集仍会保留在浏览器本地。');
+      if (!confirmed) {
+        return;
+      }
+      customSourceRemove(id)
+        .then(function () {
+          return Promise.all([customSourceList(), loadSources()]);
+        })
+        .then(function (results) {
+          state.sourceNames = {};
+          (results[0] || []).forEach(function (item) {
+            state.sourceNames[item.id] = item.name;
+          });
+          renderCustomSources();
+        })
+        .catch(function (error) {
+          window.alert(error.message || '删除自定义源失败');
+        });
+    });
+  });
+}
+
+// 网络地址导入栏的默认配置地址：打开弹窗即预填，也可点「使用默认地址」恢复，
+// 输入框保留且可手动改成任意地址。
+var CS_IMPORT_DEFAULT_URL =
+  'https://cfkua.wokaotianshi.eu.org/https://raw.githubusercontent.com/' +
+  'wokaotianshi123/wokaotianshi123.github.io/refs/heads/main/hongguo/config.json';
+
+function openCustomSourceImportUrlDialog() {
+  var overlay = document.createElement('div');
+  overlay.style.cssText =
+    'position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:1000;display:flex;align-items:center;justify-content:center';
+  overlay.innerHTML =
+    '<div style="background:var(--panel,#1e2430);border:1px solid var(--border,#333);border-radius:12px;' +
+    'width:min(480px,92vw);padding:20px;box-sizing:border-box;max-height:90vh;overflow:auto">' +
+    '<h3 style="margin:0 0 14px">从网络地址导入</h3>' +
+    '<div style="font-size:12px;opacity:0.75;margin-bottom:10px">粘贴 TVBox 配置 / JSON / TXT 远程地址，核心自动抓取并解析导入；「导入文件」仍可本地选择。</div>' +
+    '<textarea id="cs-import-url" spellcheck="false" placeholder="https://…/config.json" ' +
+    'style="width:100%;min-height:70px;font-family:monospace;font-size:12px;box-sizing:border-box;background:var(--bg,#12161f);color:inherit;border:1px solid var(--border,#333);border-radius:8px;padding:8px">' +
+    escapeHTML(CS_IMPORT_DEFAULT_URL) +
+    '</textarea>' +
+    '<div style="margin-top:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
+    '<span style="font-size:12px;opacity:0.75">默认地址：</span>' +
+    '<button type="button" class="btn" id="cs-import-default" style="font-size:12px;padding:4px 10px">使用默认地址</button>' +
+    '</div>' +
+    '<div id="cs-import-error" style="color:#ff8b90;font-size:12px;min-height:18px;margin-top:8px"></div>' +
+    '<div style="display:flex;justify-content:flex-end;gap:8px;margin-top:6px">' +
+    '<button type="button" class="btn" id="cs-import-cancel">取消</button>' +
+    '<button type="button" class="btn" id="cs-import-go">导入</button>' +
+    '</div>' +
+    '</div>';
+  document.body.appendChild(overlay);
+  var urlInput = document.getElementById('cs-import-url');
+  var errorBox = document.getElementById('cs-import-error');
+  var goButton = document.getElementById('cs-import-go');
+  var cancelButton = document.getElementById('cs-import-cancel');
+  var defaultButton = document.getElementById('cs-import-default');
+  if (defaultButton && urlInput) {
+    defaultButton.addEventListener('click', function () {
+      urlInput.value = CS_IMPORT_DEFAULT_URL;
+      errorBox.textContent = '';
+      urlInput.focus();
+      urlInput.setSelectionRange(urlInput.value.length, urlInput.value.length);
+    });
+  }
+  if (urlInput) urlInput.focus();
+  function close() {
+    document.body.removeChild(overlay);
+  }
+  if (cancelButton) cancelButton.addEventListener('click', close);
+  if (goButton) {
+    goButton.addEventListener('click', function () {
+      var url = (urlInput.value || '').trim();
+      if (!url) {
+        errorBox.textContent = '请填写配置地址';
+        return;
+      }
+      if (!/^https?:\/\//i.test(url)) {
+        errorBox.textContent = '地址需以 http:// 或 https:// 开头';
+        return;
+      }
+      goButton.disabled = true;
+      errorBox.textContent = '';
+      customSourceImportUrl(url)
+        .then(function (result) {
+          close();
+          return afterCustomSourcesChanged(result);
+        })
+        .catch(function (error) {
+          errorBox.textContent = error.message || '导入远程配置失败';
+          goButton.disabled = false;
+        });
+    });
+  }
+}
+
+function openCustomSourceEditor(existing) {
+  var overlay = document.createElement('div');
+  overlay.style.cssText =
+    'position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:1000;display:flex;align-items:center;justify-content:center';
+  var title = existing ? '编辑自定义源' : '新增自定义源';
+  var hasRule = !!(existing && existing.rule);
+  overlay.innerHTML =
+    '<div style="background:var(--panel,#1e2430);border:1px solid var(--border,#333);border-radius:12px;' +
+    'width:min(480px,92vw);padding:20px;box-sizing:border-box;max-height:90vh;overflow:auto">' +
+    '<h3 style="margin:0 0 14px">' + title + '</h3>' +
+    '<label style="display:block;font-size:12px;opacity:0.8;margin-bottom:4px">源名称</label>' +
+    '<input id="cs-name" class="search" type="text" maxlength="40" placeholder="例如：我的影院" ' +
+    'style="width:100%;margin-bottom:12px" value="' + escapeHTML(existing ? existing.name : '') + '" />' +
+    '<label style="display:block;font-size:12px;opacity:0.8;margin-bottom:4px">源网址（MacCMS 站点根地址）</label>' +
+    '<input id="cs-base" class="search" type="url" placeholder="https://example.com" ' +
+    'style="width:100%;margin-bottom:12px" value="' + escapeHTML(existing ? existing.base : '') + '" />' +
+    '<label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:8px">' +
+    '<input id="cs-rule-on" type="checkbox"' + (hasRule ? ' checked' : '') + ' /> 使用 XBPQ 爬虫规则（粘贴规则 JSON，按字段截取）</label>' +
+    '<div id="cs-rule-wrap" style="display:' + (hasRule ? 'block' : 'none') + '">' +
+    '<textarea id="cs-rule" spellcheck="false" placeholder=\'{"主页url":"https://…","分类url":"…{cateId}-{catePg}…","数组":"…&&…","标题":"…","链接":"…"}\' ' +
+    'style="width:100%;min-height:130px;font-family:monospace;font-size:12px;box-sizing:border-box;background:var(--bg,#12161f);color:inherit;border:1px solid var(--border,#333);border-radius:8px;padding:8px">' +
+    escapeHTML(existing && existing.rule ? existing.rule : '') + '</textarea></div>' +
+    '<div id="cs-error" style="color:#ff8b90;font-size:12px;min-height:18px;margin-top:8px"></div>' +
+    '<div style="display:flex;justify-content:flex-end;gap:8px;margin-top:6px">' +
+    '<button type="button" class="btn" id="cs-cancel">取消</button>' +
+    '<button type="button" class="btn" id="cs-save">保存</button>' +
+    '</div>' +
+    '</div>';
+  document.body.appendChild(overlay);
+  var nameInput = document.getElementById('cs-name');
+  var baseInput = document.getElementById('cs-base');
+  var ruleToggle = document.getElementById('cs-rule-on');
+  var ruleWrap = document.getElementById('cs-rule-wrap');
+  var ruleInput = document.getElementById('cs-rule');
+  var errorBox = document.getElementById('cs-error');
+  var saveButton = document.getElementById('cs-save');
+  var cancelButton = document.getElementById('cs-cancel');
+  if (nameInput) nameInput.focus();
+  if (ruleToggle) {
+    ruleToggle.addEventListener('change', function () {
+      if (ruleWrap) ruleWrap.style.display = ruleToggle.checked ? 'block' : 'none';
+      if (!ruleToggle.checked && baseInput) baseInput.removeAttribute('readonly');
+      else if (baseInput) baseInput.placeholder = '留空则自动取规则「主页url」';
+    });
+  }
+  function close() {
+    document.body.removeChild(overlay);
+  }
+  if (cancelButton) {
+    cancelButton.addEventListener('click', close);
+  }
+  if (saveButton) {
+    saveButton.addEventListener('click', function () {
+      var name = (nameInput.value || '').trim();
+      var base = (baseInput.value || '').trim();
+      var useRule = ruleToggle && ruleToggle.checked;
+      var rule = useRule ? (ruleInput.value || '').trim() : '';
+      if (useRule && !rule) {
+        errorBox.textContent = '粘贴规则 JSON 后再保存，或取消勾选规则';
+        return;
+      }
+      if (!useRule && !base) {
+        errorBox.textContent = '请填写源网址（或勾选规则并粘贴规则 JSON）';
+        return;
+      }
+      saveButton.disabled = true;
+      customSourceSave({ id: existing ? existing.id : '', name: name, base: base, rule: rule }, !!existing)
+        .then(function () {
+          return Promise.all([customSourceList(), loadSources()]);
+        })
+        .then(function (results) {
+          state.sourceNames = {};
+          (results[0] || []).forEach(function (item) {
+            state.sourceNames[item.id] = item.name;
+          });
+          close();
+          renderCustomSources();
+        })
+        .catch(function (error) {
+          errorBox.textContent = error.message || '保存自定义源失败';
+          saveButton.disabled = false;
+        });
+    });
+  }
+}
+
+function render() {
+  cancelAutoNext();
+  var current = hashParams();
+  var params = current.params;
+  state.source = params.get('source') || state.source;
+  state.query = params.get('q') || '';
+  if (sourceSelect.value !== state.source) {
+    sourceSelect.value = state.source;
+  }
+  if (searchInput.value !== state.query) {
+    searchInput.value = state.query;
+  }
+  var favoritesButton = document.getElementById('favorites-btn');
+  if (favoritesButton) {
+    favoritesButton.classList.toggle('active', current.path === 'favorites');
+  }
+  var customSourcesButton = document.getElementById('custom-sources-btn');
+  if (customSourcesButton) {
+    customSourcesButton.classList.toggle('active', current.path === 'custom-sources');
+  }
+  var visibilityButton = document.getElementById('visibility-btn');
+  if (visibilityButton) {
+    visibilityButton.classList.toggle('active', current.path === 'source-visibility');
+  }
+  var task;
+  if (current.path === 'drama') {
+    task = renderDrama(params.get('id') || '', params.get('source') || '');
+  } else if (current.path === 'play') {
+    task = renderPlay(params.get('id') || '', Number(params.get('index') || 0), params.get('source') || '');
+  } else if (current.path === 'favorites') {
+    task = renderFavorites(params.get('tab') || '');
+  } else if (current.path === 'custom-sources') {
+    task = Promise.resolve().then(renderCustomSources);
+  } else if (current.path === 'source-visibility') {
+    task = renderSourceVisibility();
+  } else {
+    state.category = params.get('category') || '';
+    state.page = Number(params.get('page') || 1);
+    task = renderCatalog();
+  }
+  task.catch(function (error) {
+    view.innerHTML = '<div class="empty">' + escapeHTML(error.message || '加载失败') + '</div>';
+  });
+}
+
+sourceSelect.addEventListener('change', function () {
+  state.source = sourceSelect.value;
+  state.category = '';
+  state.page = 1;
+  state.query = '';
+  state.categories = [];
+  location.hash = hashFor({});
+});
+
+searchForm.addEventListener('submit', function (event) {
+  event.preventDefault();
+  state.query = searchInput.value.trim();
+  state.page = 1;
+  state.category = '';
+  location.hash = hashFor({});
+});
+
+window.addEventListener('hashchange', function () {
+  // 就地换集时只改了地址栏（syncEpisodeChrome 会置位 suppressHashRender），
+  // 这时不能再整页重建，否则刚复用的 <video> 会被销毁、倍速与全屏都丢。
+  if (suppressHashRender) {
+    suppressHashRender = false;
+    return;
+  }
+  var current = hashParams();
+  if (current.path !== 'play') {
+    stopPlayback();
+  } else if (Number(current.params.get('index') || 0) !== state.index) {
+    // 换集时回到默认线路，画质沿用上次的选择。
+    state.route = 0;
+  }
+  render();
+});
+
+// 关闭页面时用 sendBeacon 补一次进度，普通 fetch 在页面卸载时来不及发出。
+window.addEventListener('beforeunload', function () {
+  if (!state.drama || !navigator.sendBeacon) {
+    return;
+  }
+  var video = document.getElementById('player');
+  if (!video || !(Number(video.currentTime) > 0)) {
+    return;
+  }
+  var body = JSON.stringify({
+    list: 'history',
+    op: 'put',
+    item: currentEntry(Number(video.currentTime) || 0, Number(video.duration) || 0),
+  });
+  navigator.sendBeacon('/api/library', new Blob([body], { type: 'application/json' }));
+});
+
+loadInfo();
+Promise.all([loadSources(), loadLibrary()]).then(function () {
+  if (!location.hash) {
+    location.hash = hashFor({});
+  } else {
+    render();
+  }
+});

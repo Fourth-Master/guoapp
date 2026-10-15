@@ -9,6 +9,7 @@ import 'local_store.dart';
 import 'media_library.dart';
 import 'models.dart';
 import 'player_screen.dart';
+import 'remote_widgets.dart';
 import 'settings_screen.dart';
 import 'merge_queue_screen.dart';
 
@@ -34,6 +35,7 @@ class _LocalMediaScreenState extends State<LocalMediaScreen> {
   @override
   void initState() {
     super.initState();
+    ensureTelevisionFocus(context);
     _refresh();
   }
 
@@ -430,6 +432,8 @@ class _LocalFileRepository extends AppRepository {
     Drama drama,
     Episode episode, {
     int quality = 0,
+    int route = 0,
+    bool adBlock = true,
   }) => _plan();
   @override
   Future<PlaybackPlan?> localPlayback(Drama drama, Episode episode) => _plan();
@@ -438,6 +442,8 @@ class _LocalFileRepository extends AppRepository {
     Drama drama,
     Episode episode, {
     int quality = 0,
+    int route = 0,
+    bool adBlock = true,
   }) => throw AppFailure('此成品仅支持本地播放');
   @override
   Future<PlaybackPlan> fallback(PlaybackPlan current) => _plan();

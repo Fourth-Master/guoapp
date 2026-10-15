@@ -2,10 +2,13 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:lucide_icons_flutter/lucide_icons.dart';
 
 import 'app_layout.dart';
 import 'app_bottom_navigation.dart';
-import 'app_build.dart';
+import 'ios_dialogs.dart';
+import 'liquid_glass.dart';
+import 'liquid_tab_bar.dart';
 import 'core_bridge.dart';
 import 'catalog_filters.dart';
 import 'catalog_browser.dart';
@@ -25,8 +28,6 @@ import 'vip_icon.dart';
 import 'settings_screen.dart';
 import 'profiles_screen.dart';
 import 'search_input.dart';
-import 'source_gate_dialog.dart';
-import 'source_gate_taps.dart';
 import 'sources_screen.dart';
 import 'batch_download_screen.dart';
 import 'batch_downloads.dart';
@@ -46,6 +47,9 @@ class _HomeScreenState extends State<HomeScreen> {
   static const _recommendationCategory = 'app:recommendations';
   final _search = TextEditingController();
   final _scroll = ScrollController();
+  final _filtersKey = GlobalKey<RemoteRowState>();
+  final _gridKey = GlobalKey<RemoteGridState>();
+  final _navKey = GlobalKey<RemoteListState>();
   Timer? _debounce;
   late SourceSite _source;
   bool _allSources = false;
@@ -70,14 +74,15 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _refreshingUpdatedCache = false;
   bool _selectionMode = false;
   bool _showRecommendations = false;
-  final _recentTaps = RepeatTapGate();
-  String _sourceSignature = '';
   bool _catalogLoadScheduled = false;
+  bool _openingPlayback = false;
 
   List<SourceGroup> get _sourceGroups {
-    final groups = SourceGroup.fromSources(widget.store.sources);
+    // 首页只显示「源显示列表」中开启的站源，被隐藏的站源不出现在分组里。
+    final visible = widget.store.visibleSources;
+    final groups = SourceGroup.fromSources(visible);
     return [
-      if (groups.length > 1) SourceGroup('all', '全部站源', widget.store.sources),
+      if (groups.length > 1) SourceGroup('all', '全部站源', visible),
       ...groups,
     ];
   }
@@ -86,7 +91,13 @@ class _HomeScreenState extends State<HomeScreen> {
       _sourceGroups
           .where((group) => group.id == (_allSources ? 'all' : _source.groupId))
           .firstOrNull ??
-      SourceGroup(_source.groupId, _source.groupName, [_source]);
+      (() {
+        final visible = widget.store.visibleSources;
+        final site = visible.any((s) => s.id == _source.id)
+            ? _source
+            : (visible.firstOrNull ?? _source);
+        return SourceGroup(site.groupId, site.groupName, [site]);
+      })();
   bool get _onlineSearch => _group.sources.any((source) => source.onlineSearch);
   bool get _searchSuggestions =>
       _group.sources.any((source) => source.searchSuggestions);
@@ -158,32 +169,6 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _updateChanged() {
     if (mounted) setState(() {});
-  }
-
-  /// 密码锁切换后可见站源会变，这里把当前站源归一化到仍然可见的站源。
-  void _sourcesChanged() {
-    if (!mounted) return;
-    final visible = widget.store.sources;
-    final signature = visible.map((site) => site.id).join(',');
-    if (signature == _sourceSignature) return;
-    final wasEmpty = _sourceSignature.isEmpty;
-    _sourceSignature = signature;
-    if (visible.isEmpty) {
-      setState(() {
-        _items = [];
-        _hasMore = false;
-        _loading = false;
-        _loadingMore = false;
-      });
-      return;
-    }
-    final allowed = visible.map((site) => site.id).toSet();
-    if (!wasEmpty &&
-        allowed.contains(_source.id) &&
-        _source.id == widget.store.source) {
-      return;
-    }
-    _changeSource(SourceSite.byId(widget.store.source));
   }
 
   void _catalogUpdated(String source) {
@@ -347,6 +332,23 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
     );
     if (!mounted) return;
+    // 站源显示列表可能变了：当前源被隐藏时落到第一个可见站源。
+    final next = SourceSite.byId(widget.store.source);
+    if (next.id != _source.id) {
+      setState(() {
+        _source = next;
+        _allSources = false;
+        _items = [];
+        _hasMore = true;
+        _error = null;
+      });
+      unawaited(
+        saveUserChange(
+          context,
+          () => widget.store.setCatalogSource(next.id, allSources: false),
+        ),
+      );
+    }
     await _loadCategories();
     if (mounted && (!_onlineSearch || _submittedQuery.isEmpty)) {
       await _load(useCache: true);
@@ -426,7 +428,6 @@ class _HomeScreenState extends State<HomeScreen> {
     _scroll.addListener(_onCatalogScroll);
     _source = SourceSite.byId(widget.store.source);
     _allSources = widget.store.catalogView.allSources;
-    _sourceSignature = widget.store.sources.map((site) => site.id).join(',');
     _browser = CatalogBrowser(widget.repository);
     _updater = LibraryUpdater(
       widget.repository,
@@ -434,9 +435,8 @@ class _HomeScreenState extends State<HomeScreen> {
       onCatalogChanged: _catalogUpdated,
     )..addListener(_updateChanged);
     _updater.startWatching();
-    widget.store.addListener(_sourcesChanged);
     widget.repository.catalogUpdates.addListener(_metadataChanged);
-    if (widget.store.sources.isNotEmpty) {
+    if (widget.store.visibleSources.isNotEmpty) {
       _load(useCache: true);
       _loadCategories();
     } else {
@@ -449,7 +449,6 @@ class _HomeScreenState extends State<HomeScreen> {
     _updater.removeListener(_updateChanged);
     _updater.dispose();
     _cacheRefreshTimer?.cancel();
-    widget.store.removeListener(_sourcesChanged);
     widget.repository.catalogUpdates.removeListener(_metadataChanged);
     _generation++;
     _categoryGeneration++;
@@ -644,6 +643,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _openDrama(Drama drama, {bool resume = false, bool download = false}) {
+    if (!download && _openingPlayback) return;
     _pauseCatalog();
     if (download) {
       Navigator.of(context).push(
@@ -658,13 +658,16 @@ class _HomeScreenState extends State<HomeScreen> {
       );
       return;
     }
+    _openingPlayback = true;
     unawaited(
       openPlaybackDirectly(
         context,
         drama: drama,
         repository: widget.repository,
         store: widget.store,
-      ),
+      ).whenComplete(() {
+        _openingPlayback = false;
+      }),
     );
   }
 
@@ -673,25 +676,6 @@ class _HomeScreenState extends State<HomeScreen> {
     _selectionMode = false;
     _selectedDramas.clear();
   });
-
-  /// 连点「最近观看」6 次弹出站源密码锁（用于启用 / 关闭密码功能）。
-  /// 仅多源包（真果鉴）生效；红果鉴单源包无密码功能。
-  void _onNavSelected(int tab) {
-    if (allSourcesEnabled && tab == 2) {
-      if (_recentTaps.register(tab)) {
-        _openSourceGate();
-        return;
-      }
-    } else {
-      _recentTaps.reset();
-    }
-    _changeTab(tab);
-  }
-
-  void _openSourceGate() {
-    _pauseCatalog();
-    unawaited(showSourceGateDialog(context, widget.store));
-  }
 
   void _cancelSelection() => setState(() {
     _selectionMode = false;
@@ -792,9 +776,11 @@ class _HomeScreenState extends State<HomeScreen> {
 
   List<Drama> get _visible {
     final query = _search.text.trim().toLowerCase();
+    final hidden = widget.store.hiddenSites;
     return sortCatalog(
       _items.where((drama) {
         if (!widget.store.allowsSource(drama.source)) return false;
+        if (hidden.contains(drama.source)) return false;
         if (_category.startsWith('local:') &&
             categoryName(drama.category) != _category.substring(6)) {
           return false;
@@ -810,278 +796,527 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  bool get _catalogBusy =>
+      _loading ||
+      _loadingMore ||
+      _categoriesLoading ||
+      _group.sources.any((source) => _updater.busy(source.id));
+
+  void _moreAction(String value) {
+    if (value == 'update') {
+      _refreshCatalog();
+    } else if (value == 'select') {
+      setState(() => _selectionMode = true);
+    } else if (value == 'sources') {
+      _manageSources();
+    } else if (value == 'settings') {
+      Navigator.push(
+        context,
+        MaterialPageRoute<void>(
+          builder: (_) => SettingsScreen(
+            repository: widget.repository,
+            store: widget.store,
+          ),
+        ),
+      );
+    } else if (value == 'users') {
+      Navigator.push(
+        context,
+        MaterialPageRoute<void>(
+          builder: (_) => ProfilesScreen(store: widget.store),
+        ),
+      );
+    } else if (value == 'display') {
+      _chooseDisplayMode();
+    } else if (value == 'about') {
+      showAboutDialog(
+        context: context,
+        applicationName: appName,
+        applicationVersion: AppLayout.versionOf(context),
+        applicationIcon: Icon(
+          glassDesign(context)
+              ? LucideIcons.circlePlay
+              : Icons.play_circle_filled_rounded,
+          size: 48,
+          color: const Color(0xFFFF765F),
+        ),
+        children: [const Text('独立运行，打开即可浏览和播放。观看记录与追剧收藏保存在当前设备。')],
+      );
+    }
+  }
+
+  static const _tabTitles = ['发现', '追剧', '最近观看', '下载'];
+
+  PreferredSizeWidget _glassAppBar() {
+    final colors = Theme.of(context).colorScheme;
+    final wide = MediaQuery.sizeOf(context).width >= 840;
+    final largeTitle = TextStyle(
+      fontSize: wide ? 24 : 30,
+      height: 1.1,
+      fontWeight: FontWeight.w800,
+      letterSpacing: 0,
+      color: colors.onSurface,
+    );
+    final catalog = _tab == 0 && !_selectionMode;
+    final canSelect =
+        !_showRecommendations &&
+        widget.store.canDownload &&
+        widget.repository.supportsDownloads;
+    final customView =
+        widget.store.catalogView.sort != CatalogSort.source ||
+        widget.store.catalogView.release.isNotEmpty;
+    final updating = _group.sources.any((source) => _updater.busy(source.id));
+    final Widget title;
+    if (_selectionMode) {
+      title = Text('选择短剧', style: largeTitle);
+    } else if (_tab == 0) {
+      title = PullDownButton(
+        entries: [
+          for (final group in _sourceGroups)
+            PullDownEntry(
+              label: group.name,
+              checked: group.id == _group.id,
+              onPressed: () => _changeGroup(group),
+            ),
+        ],
+        builder: (context, open) => GlassTapTarget(
+          key: const ValueKey('source-switch'),
+          onTap: _sourceGroups.length > 1 ? open : null,
+          child: Semantics(
+            button: _sourceGroups.length > 1,
+            label: '切换站源',
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Flexible(
+                  child: Text(
+                    _group.name,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: largeTitle,
+                  ),
+                ),
+                if (_sourceGroups.length > 1) ...[
+                  const SizedBox(width: 6),
+                  Icon(
+                    LucideIcons.chevronDown,
+                    size: 20,
+                    color: colors.onSurfaceVariant,
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      );
+    } else {
+      title = Text(
+        _tabTitles[_tab.clamp(0, _tabTitles.length - 1)],
+        style: largeTitle,
+      );
+    }
+    return AppBar(
+      toolbarHeight: 64,
+      centerTitle: false,
+      titleSpacing: 20,
+      automaticallyImplyLeading: false,
+      title: title,
+      actions: [
+        if (_selectionMode) ...[
+          TextButton(
+            key: const ValueKey('clear-catalog-selection'),
+            onPressed: _selectedDramas.isEmpty
+                ? null
+                : () => setState(_selectedDramas.clear),
+            child: const Text('清空'),
+          ),
+          const SizedBox(width: 4),
+          GlassIconButton(
+            key: const ValueKey('cancel-catalog-selection'),
+            icon: LucideIcons.x,
+            tooltip: '取消',
+            onPressed: _cancelSelection,
+          ),
+        ] else ...[
+          if (_tab == 1) ...[
+            GlassIconButton(
+              key: const ValueKey('follow-lan-sync'),
+              icon: LucideIcons.monitorSmartphone,
+              tooltip: '追剧同步',
+              onPressed: () => openLanSync(context),
+            ),
+            const SizedBox(width: 8),
+          ],
+          if (catalog) ...[
+            GlassButtonGroup(
+              children: [
+                if (updating || _loading && _items.isNotEmpty)
+                  const GlassGroupItem(
+                    key: ValueKey('catalog-refresh'),
+                    tooltip: '正在更新',
+                    onPressed: null,
+                    child: SizedBox.square(
+                      dimension: 18,
+                      child: CircularProgressIndicator.adaptive(strokeWidth: 2),
+                    ),
+                  ),
+                if (!_showRecommendations)
+                  GlassGroupItem(
+                    icon: LucideIcons.arrowUpDown,
+                    tooltip: '排序与筛选 · ${widget.store.catalogView.sort.label}',
+                    highlighted: customView,
+                    onPressed: _chooseCatalogView,
+                  ),
+                GlassGroupItem(
+                  key: const ValueKey('open-rankings'),
+                  icon: LucideIcons.trophy,
+                  tooltip: '榜单',
+                  onPressed: widget.store.visibleSources.isEmpty
+                      ? null
+                      : _openRankings,
+                ),
+                GlassGroupItem(
+                  key: const ValueKey('toggle-search'),
+                  icon: _searchVisible
+                      ? LucideIcons.searchX
+                      : LucideIcons.search,
+                  tooltip: _searchVisible ? '收起搜索' : '搜索',
+                  highlighted: _searchVisible,
+                  onPressed: _toggleSearch,
+                ),
+              ],
+            ),
+            const SizedBox(width: 8),
+          ],
+          PullDownButton(
+            entries: [
+              if (catalog && !_showRecommendations)
+                PullDownEntry(
+                  label: '更新剧库',
+                  icon: LucideIcons.rotateCw,
+                  onPressed: widget.store.visibleSources.isEmpty || updating
+                      ? null
+                      : () => _moreAction('update'),
+                ),
+              if (catalog && canSelect)
+                PullDownEntry(
+                  label: '多选下载',
+                  icon: LucideIcons.listChecks,
+                  onPressed: () => _moreAction('select'),
+                ),
+              if (widget.repository.supportsSourceManagement)
+                PullDownEntry(
+                  label: '站源管理',
+                  icon: LucideIcons.server,
+                  dividerBefore: catalog,
+                  onPressed: () => _moreAction('sources'),
+                ),
+              PullDownEntry(
+                label: '用户管理',
+                icon: LucideIcons.users,
+                dividerBefore:
+                    catalog && !widget.repository.supportsSourceManagement,
+                onPressed: () => _moreAction('users'),
+              ),
+              PullDownEntry(
+                label: '设置与备份',
+                icon: LucideIcons.settings,
+                onPressed: () => _moreAction('settings'),
+              ),
+              PullDownEntry(
+                label: '界面模式',
+                icon: LucideIcons.monitor,
+                onPressed: () => _moreAction('display'),
+              ),
+              PullDownEntry(
+                label: '关于$appName',
+                icon: LucideIcons.info,
+                onPressed: () => _moreAction('about'),
+              ),
+            ],
+            builder: (context, open) => GlassIconButton(
+              icon: LucideIcons.ellipsis,
+              tooltip: '更多',
+              onPressed: open,
+            ),
+          ),
+        ],
+        const SizedBox(width: 16),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) => AnimatedBuilder(
     animation: widget.store,
     builder: (context, _) => LayoutBuilder(
       builder: (context, constraints) {
         final television = AppLayout.isTelevision(context);
-        final desktop = constraints.maxWidth >= 840;
+        final glass = glassDesign(context);
+        final desktop =
+            Theme.of(context).platform != TargetPlatform.iOS &&
+            constraints.maxWidth >= 840;
         final scaffold = Scaffold(
-          appBar: AppBar(
-            toolbarHeight: television ? 64 : null,
-            titleSpacing: 12,
-            title: _selectionMode
-                ? const Text(
-                    '选择短剧',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  )
-                : _tab == 0
-                ? PopupMenuButton<SourceGroup>(
-                    key: const ValueKey('source-switch'),
-                    tooltip: '切换站源',
-                    enabled: _sourceGroups.length > 1,
-                    onSelected: _changeGroup,
-                    itemBuilder: (_) => [
-                      for (final group in _sourceGroups)
-                        PopupMenuItem(
-                          value: group,
-                          child: Row(
-                            children: [
-                              Expanded(child: Text(group.name)),
-                              if (group.id == _group.id)
-                                const Icon(Icons.check_rounded, size: 20),
-                            ],
-                          ),
-                        ),
-                    ],
-                    child: SizedBox(
-                      height: 48,
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Flexible(
-                            child: Text(
-                              _group.name,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                fontWeight: FontWeight.w800,
+          extendBody: glass && !desktop,
+          appBar: glass
+              ? _glassAppBar()
+              : AppBar(
+                  toolbarHeight: television ? 64 : null,
+                  titleSpacing: 12,
+                  title: _selectionMode
+                      ? const Text(
+                          '选择短剧',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        )
+                      : _tab == 0
+                      ? PopupMenuButton<SourceGroup>(
+                          key: const ValueKey('source-switch'),
+                          tooltip: '切换站源',
+                          enabled: _sourceGroups.length > 1,
+                          onSelected: _changeGroup,
+                          itemBuilder: (_) => [
+                            for (final group in _sourceGroups)
+                              PopupMenuItem(
+                                value: group,
+                                child: Row(
+                                  children: [
+                                    Expanded(child: Text(group.name)),
+                                    if (group.id == _group.id)
+                                      const Icon(Icons.check_rounded, size: 20),
+                                  ],
+                                ),
                               ),
+                          ],
+                          child: SizedBox(
+                            height: 48,
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Flexible(
+                                  child: Text(
+                                    _group.name,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.w800,
+                                    ),
+                                  ),
+                                ),
+                                if (_sourceGroups.length > 1)
+                                  const Icon(Icons.expand_more_rounded),
+                              ],
                             ),
                           ),
-                          if (_sourceGroups.length > 1)
-                            const Icon(Icons.expand_more_rounded),
-                        ],
+                        )
+                      : const Text(appName),
+                  actions: [
+                    if (_selectionMode) ...[
+                      TextButton(
+                        key: const ValueKey('clear-catalog-selection'),
+                        onPressed: _selectedDramas.isEmpty
+                            ? null
+                            : () => setState(_selectedDramas.clear),
+                        child: const Text('清空'),
                       ),
-                    ),
-                  )
-                : const Text(appName),
-            actions: [
-              if (_selectionMode) ...[
-                TextButton(
-                  key: const ValueKey('clear-catalog-selection'),
-                  onPressed: _selectedDramas.isEmpty
-                      ? null
-                      : () => setState(_selectedDramas.clear),
-                  child: const Text('清空'),
-                ),
-                TextButton(
-                  key: const ValueKey('cancel-catalog-selection'),
-                  onPressed: _cancelSelection,
-                  child: const Text('取消'),
-                ),
-              ] else ...[
-                if (_tab == 1)
-                  IconButton(
-                    key: const ValueKey('follow-lan-sync'),
-                    tooltip: '追剧同步',
-                    onPressed: () => openLanSync(context),
-                    icon: const Icon(Icons.sync_rounded),
-                  ),
-                if (_tab == 0) ...[
-                  if (!_showRecommendations)
-                    IconButton(
-                      tooltip: '排序与筛选 · ${widget.store.catalogView.sort.label}',
-                      onPressed: _chooseCatalogView,
-                      color:
-                          widget.store.catalogView.sort != CatalogSort.source ||
-                              widget.store.catalogView.release.isNotEmpty
-                          ? Theme.of(context).colorScheme.primary
-                          : null,
-                      icon: const Icon(Icons.sort_rounded),
-                    ),
-                  IconButton(
-                    key: const ValueKey('open-rankings'),
-                    tooltip: '榜单',
-                    onPressed: widget.store.sources.isEmpty
-                        ? null
-                        : _openRankings,
-                    icon: const Icon(Icons.leaderboard_outlined),
-                  ),
-                  if (!_showRecommendations &&
-                      widget.store.canDownload &&
-                      widget.repository.supportsDownloads)
-                    IconButton(
-                      key: const ValueKey('select-catalog-dramas'),
-                      tooltip: '多选下载',
-                      onPressed: () => setState(() => _selectionMode = true),
-                      icon: const Icon(Icons.checklist_rounded),
-                    ),
-                  IconButton(
-                    key: const ValueKey('toggle-search'),
-                    tooltip: _searchVisible ? '收起搜索' : '搜索',
-                    icon: Icon(
-                      _searchVisible
-                          ? Icons.search_off_rounded
-                          : Icons.search_rounded,
-                    ),
-                    onPressed: _toggleSearch,
-                  ),
-                ],
-                if (_tab == 0 &&
-                    !_showRecommendations &&
-                    constraints.maxWidth >= 400)
-                  RefreshAction(
-                    key: const ValueKey('catalog-refresh'),
-                    loading:
-                        _loading ||
-                        _loadingMore ||
-                        _categoriesLoading ||
-                        _group.sources.any(
-                          (source) => _updater.busy(source.id),
+                      TextButton(
+                        key: const ValueKey('cancel-catalog-selection'),
+                        onPressed: _cancelSelection,
+                        child: const Text('取消'),
+                      ),
+                    ] else ...[
+                      if (_tab == 1)
+                        IconButton(
+                          key: const ValueKey('follow-lan-sync'),
+                          tooltip: '追剧同步',
+                          onPressed: () => openLanSync(context),
+                          icon: const Icon(Icons.sync_rounded),
                         ),
-                    tooltip: '更新剧库',
-                    onPressed: widget.store.sources.isEmpty
-                        ? null
-                        : _refreshCatalog,
-                  ),
-                PopupMenuButton<String>(
-                  tooltip: '更多',
-                  onSelected: (value) {
-                    if (value == 'update') {
-                      _refreshCatalog();
-                    } else if (value == 'sources') {
-                      _manageSources();
-                    } else if (value == 'settings') {
-                      Navigator.push(
-                        context,
-                        MaterialPageRoute<void>(
-                          builder: (_) => SettingsScreen(
-                            repository: widget.repository,
-                            store: widget.store,
+                      if (_tab == 0) ...[
+                        if (!_showRecommendations)
+                          IconButton(
+                            tooltip:
+                                '排序与筛选 · ${widget.store.catalogView.sort.label}',
+                            onPressed: _chooseCatalogView,
+                            color:
+                                widget.store.catalogView.sort !=
+                                        CatalogSort.source ||
+                                    widget.store.catalogView.release.isNotEmpty
+                                ? Theme.of(context).colorScheme.primary
+                                : null,
+                            icon: const Icon(Icons.sort_rounded),
                           ),
+                        IconButton(
+                          key: const ValueKey('open-rankings'),
+                          tooltip: '榜单',
+                          onPressed: widget.store.visibleSources.isEmpty
+                              ? null
+                              : _openRankings,
+                          icon: const Icon(Icons.leaderboard_outlined),
                         ),
-                      );
-                    } else if (value == 'users') {
-                      Navigator.push(
-                        context,
-                        MaterialPageRoute<void>(
-                          builder: (_) => ProfilesScreen(store: widget.store),
+                        if (!_showRecommendations &&
+                            widget.store.canDownload &&
+                            widget.repository.supportsDownloads)
+                          IconButton(
+                            key: const ValueKey('select-catalog-dramas'),
+                            tooltip: '多选下载',
+                            onPressed: () =>
+                                setState(() => _selectionMode = true),
+                            icon: const Icon(Icons.checklist_rounded),
+                          ),
+                        IconButton(
+                          key: const ValueKey('toggle-search'),
+                          tooltip: _searchVisible ? '收起搜索' : '搜索',
+                          icon: Icon(
+                            _searchVisible
+                                ? Icons.search_off_rounded
+                                : Icons.search_rounded,
+                          ),
+                          onPressed: _toggleSearch,
                         ),
-                      );
-                    } else if (value == 'display') {
-                      _chooseDisplayMode();
-                    } else if (value == 'about') {
-                      showAboutDialog(
-                        context: context,
-                        applicationName: appName,
-                        applicationVersion: AppLayout.versionOf(context),
-                        applicationIcon: const Icon(
-                          Icons.play_circle_filled_rounded,
-                          size: 48,
-                          color: Color(0xFFFF765F),
+                      ],
+                      if (_tab == 0 &&
+                          !_showRecommendations &&
+                          constraints.maxWidth >= 400)
+                        RefreshAction(
+                          key: const ValueKey('catalog-refresh'),
+                          loading: _catalogBusy,
+                          tooltip: '更新剧库',
+                          onPressed: widget.store.visibleSources.isEmpty
+                              ? null
+                              : _refreshCatalog,
                         ),
-                        children: [
-                          const Text('独立运行，打开即可浏览和播放。观看记录与追剧收藏保存在当前设备。'),
-                        ],
-                      );
-                    }
-                  },
-                  itemBuilder: (_) => [
-                    if (_tab == 0 &&
-                        !_showRecommendations &&
-                        constraints.maxWidth < 400)
-                      PopupMenuItem(
-                        value: 'update',
-                        enabled:
-                            widget.store.sources.isNotEmpty &&
-                            !_group.sources.any(
-                              (source) => _updater.busy(source.id),
+                      PopupMenuButton<String>(
+                        tooltip: '更多',
+                        onSelected: _moreAction,
+                        itemBuilder: (_) => [
+                          if (_tab == 0 &&
+                              !_showRecommendations &&
+                              constraints.maxWidth < 400)
+                            PopupMenuItem(
+                              value: 'update',
+                              enabled:
+                                  widget.store.visibleSources.isNotEmpty &&
+                                  !_group.sources.any(
+                                    (source) => _updater.busy(source.id),
+                                  ),
+                              child: const Text('更新剧库'),
                             ),
-                        child: const Text('更新剧库'),
+                          if (widget.repository.supportsSourceManagement)
+                            const PopupMenuItem(
+                              value: 'sources',
+                              child: Text('站源管理'),
+                            ),
+                          const PopupMenuItem(
+                            value: 'users',
+                            child: Text('用户管理'),
+                          ),
+                          const PopupMenuItem(
+                            value: 'settings',
+                            child: Text('设置与备份'),
+                          ),
+                          const PopupMenuItem(
+                            value: 'display',
+                            child: Text('界面模式'),
+                          ),
+                          const PopupMenuItem(
+                            value: 'about',
+                            child: Text('关于$appName'),
+                          ),
+                        ],
                       ),
-                    if (widget.repository.supportsSourceManagement)
-                      const PopupMenuItem(
-                        value: 'sources',
-                        child: Text('站源管理'),
-                      ),
-                    const PopupMenuItem(value: 'users', child: Text('用户管理')),
-                    const PopupMenuItem(
-                      value: 'settings',
-                      child: Text('设置与备份'),
-                    ),
-                    const PopupMenuItem(value: 'display', child: Text('界面模式')),
-                    const PopupMenuItem(
-                      value: 'about',
-                      child: Text('关于$appName'),
-                    ),
+                    ],
+                    const SizedBox(width: 8),
                   ],
                 ),
-              ],
-              const SizedBox(width: 8),
-            ],
-          ),
           body: SafeArea(
             top: false,
+            bottom: !glass || desktop,
             child: Row(
               children: [
                 if (television) ...[
                   SizedBox(
                     width: 164,
-                    child: Padding(
+                    child: RemoteList(
+                      key: _navKey,
+                      itemKeys: [
+                        'discover',
+                        'saved',
+                        'history',
+                        if (widget.store.canDownload) 'downloads',
+                      ],
+                      itemExtent: 64,
+                      spacing: 14,
                       padding: const EdgeInsets.fromLTRB(8, 24, 8, 12),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
-                        children: [
-                          for (final entry in [
-                            (Icons.explore_rounded, '发现'),
-                            (Icons.bookmark_rounded, '追剧'),
-                            (Icons.history_rounded, '最近观看'),
-                            if (widget.store.canDownload)
-                              (Icons.download_rounded, '下载'),
-                          ].indexed)
-                            Padding(
-                              padding: const EdgeInsets.only(bottom: 14),
-                              child: RemoteButton(
-                                key: ValueKey('tv-nav-${entry.$1}'),
-                                label: entry.$2.$2,
-                                icon: entry.$2.$1,
-                                selected: _tab == entry.$1,
-                                autofocus: entry.$1 == 0,
-                                onPressed: () => _onNavSelected(entry.$1),
-                              ),
-                            ),
-                        ],
-                      ),
+                      autofocus: true,
+                      itemBuilder: (_, index, node, onFocus) {
+                        final entries = [
+                          (Icons.explore_rounded, '发现'),
+                          (Icons.bookmark_rounded, '追剧'),
+                          (Icons.history_rounded, '最近观看'),
+                          if (widget.store.canDownload)
+                            (Icons.download_rounded, '下载'),
+                        ];
+                        final entry = entries[index];
+                        return RemoteButton(
+                          key: ValueKey('tv-nav-$index'),
+                          label: entry.$2,
+                          icon: entry.$1,
+                          selected: _tab == index,
+                          focusNode: node,
+                          onFocus: onFocus,
+                          onPressed: () => _changeTab(index),
+                        );
+                      },
                     ),
                   ),
                   const VerticalDivider(width: 1),
                 ] else if (desktop) ...[
                   NavigationRail(
                     selectedIndex: _tab,
-                    onDestinationSelected: _onNavSelected,
+                    onDestinationSelected: _changeTab,
                     labelType: NavigationRailLabelType.all,
                     groupAlignment: -.8,
                     destinations: [
                       NavigationRailDestination(
-                        icon: Icon(Icons.explore_outlined),
-                        selectedIcon: Icon(Icons.explore),
+                        icon: Icon(
+                          glass ? LucideIcons.compass : Icons.explore_outlined,
+                        ),
+                        selectedIcon: Icon(
+                          glass ? LucideIcons.compass : Icons.explore,
+                        ),
                         label: Text('发现'),
                       ),
                       NavigationRailDestination(
-                        icon: Icon(Icons.bookmark_border_rounded),
-                        selectedIcon: Icon(Icons.bookmark_rounded),
+                        icon: Icon(
+                          glass
+                              ? LucideIcons.bookmark
+                              : Icons.bookmark_border_rounded,
+                        ),
+                        selectedIcon: Icon(
+                          glass
+                              ? LucideIcons.bookmarkCheck
+                              : Icons.bookmark_rounded,
+                        ),
                         label: Text('追剧'),
                       ),
                       NavigationRailDestination(
-                        icon: Icon(Icons.history_rounded),
+                        icon: Icon(
+                          glass ? LucideIcons.history : Icons.history_rounded,
+                        ),
                         label: Text('最近观看'),
                       ),
                       if (widget.store.canDownload)
                         NavigationRailDestination(
-                          icon: Icon(Icons.download_outlined),
-                          selectedIcon: Icon(Icons.download_rounded),
+                          icon: Icon(
+                            glass
+                                ? LucideIcons.arrowDownToLine
+                                : Icons.download_outlined,
+                          ),
+                          selectedIcon: Icon(
+                            glass
+                                ? LucideIcons.arrowDownToLine
+                                : Icons.download_rounded,
+                          ),
                           label: Text('下载'),
                         ),
                     ],
@@ -1090,10 +1325,12 @@ class _HomeScreenState extends State<HomeScreen> {
                 ],
                 Expanded(
                   child: _tab == 0
-                      ? widget.store.sources.isEmpty
-                            ? const StatusPanel(
-                                title: '暂无可用站源',
-                                message: '请联系管理员为当前用户开放站源。',
+                      ? widget.store.visibleSources.isEmpty
+                            ? StatusPanel(
+                                title: '暂无显示中的站源',
+                                message: widget.store.sources.isEmpty
+                                    ? '请联系管理员为当前用户开放站源。'
+                                    : '所有站源已在「源显示列表」中关闭，请到站源管理中重新开启。',
                               )
                             : _catalog(selectionInBody: desktop || television)
                       : _tab == 3
@@ -1115,6 +1352,9 @@ class _HomeScreenState extends State<HomeScreen> {
                                   widget.store.canDownload
                               ? (drama) => _openDrama(drama, download: true)
                               : null,
+                          remoteAutofocus: television,
+                          onExitLeft: () =>
+                              _navKey.currentState?.focusCurrent(),
                         ),
                 ),
               ],
@@ -1124,9 +1364,31 @@ class _HomeScreenState extends State<HomeScreen> {
               ? null
               : _selectionMode
               ? _selectionBar()
+              : glass
+              ? LiquidTabBar(
+                  selectedIndex: _tab,
+                  onSelected: _changeTab,
+                  items: [
+                    const LiquidTabItem(icon: LucideIcons.compass, label: '发现'),
+                    const LiquidTabItem(
+                      icon: LucideIcons.bookmark,
+                      selectedIcon: LucideIcons.bookmarkCheck,
+                      label: '追剧',
+                    ),
+                    const LiquidTabItem(
+                      icon: LucideIcons.history,
+                      label: '最近观看',
+                    ),
+                    if (widget.store.canDownload)
+                      const LiquidTabItem(
+                        icon: LucideIcons.arrowDownToLine,
+                        label: '下载',
+                      ),
+                  ],
+                )
               : AppBottomNavigation(
                   selectedIndex: _tab,
-                  onDestinationSelected: _onNavSelected,
+                  onDestinationSelected: _changeTab,
                   destinations: [
                     NavigationDestination(
                       icon: Icon(Icons.explore_outlined),
@@ -1233,6 +1495,10 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         CatalogFilters(
           key: ValueKey('filters-${_group.id}'),
+          remoteKey: _filtersKey,
+          onExitDown: television
+              ? () => _gridKey.currentState?.focusCurrent()
+              : null,
           categories: _displayCategories,
           category: _displayCategory,
           error: _categoriesError,
@@ -1261,6 +1527,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 repository: widget.repository,
                 store: widget.store,
                 embedded: true,
+                gridKey: _gridKey,
               ),
             ),
           )
@@ -1275,7 +1542,7 @@ class _HomeScreenState extends State<HomeScreen> {
                       child: Column(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          CircularProgressIndicator(),
+                          CircularProgressIndicator.adaptive(),
                           SizedBox(height: 18),
                           Text('正在加载剧集'),
                         ],
@@ -1300,7 +1567,7 @@ class _HomeScreenState extends State<HomeScreen> {
                       title: '没有找到匹配的短剧',
                       message: _hideVip
                           ? '可以换个搜索词，或显示 VIP 内容。'
-                          : widget.store.sources.length > 1
+                          : widget.store.visibleSources.length > 1
                           ? '可以换个搜索词或切换站源。'
                           : '可以换个搜索词，或刷新后重试。',
                       onRetry:
@@ -1321,8 +1588,6 @@ class _HomeScreenState extends State<HomeScreen> {
                           return _televisionGrid(
                             items,
                             constraints.maxWidth,
-                            key:
-                                'catalog-${_group.id}-$_category-$_submittedQuery',
                             controller: _scroll,
                             footer: Padding(
                               padding: const EdgeInsets.fromLTRB(18, 0, 18, 24),
@@ -1343,7 +1608,7 @@ class _HomeScreenState extends State<HomeScreen> {
                         final padding = constraints.maxWidth < 600
                             ? 16.0
                             : 24.0;
-                        return RefreshIndicator(
+                        return RefreshIndicator.adaptive(
                           onRefresh: _refreshCatalog,
                           child: CustomScrollView(
                             controller: _scroll,
@@ -1369,10 +1634,14 @@ class _HomeScreenState extends State<HomeScreen> {
                               ),
                               SliverToBoxAdapter(
                                 child: Padding(
-                                  padding: const EdgeInsets.only(bottom: 24),
+                                  padding: EdgeInsets.only(
+                                    bottom:
+                                        24 +
+                                        MediaQuery.paddingOf(context).bottom,
+                                  ),
                                   child: Center(
                                     child: _loadingMore
-                                        ? const CircularProgressIndicator()
+                                        ? const CircularProgressIndicator.adaptive()
                                         : _hasMore
                                         ? OutlinedButton.icon(
                                             onPressed: () => _load(more: true),
@@ -1407,7 +1676,70 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  Widget _glassSelectionBar() {
+    final colors = Theme.of(context).colorScheme;
+    final count = _selectedDramas.length;
+    final bottom = MediaQuery.paddingOf(context).bottom;
+    return Padding(
+      padding: EdgeInsets.fromLTRB(16, 0, 16, bottom < 18 ? 12 : bottom - 6),
+      child: LiquidGlass(
+        borderRadius: const BorderRadius.all(Radius.circular(32)),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 8, 8, 8),
+          child: Row(
+            children: [
+              Expanded(
+                child: Semantics(
+                  liveRegion: true,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        count == 0 ? '点选要下载的短剧' : '已选 $count 部',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w700,
+                          letterSpacing: 0,
+                        ),
+                      ),
+                      Text(
+                        count == 0
+                            ? '最多 ${BatchDownloads.maxDramas} 部'
+                            : '下一步选择分集和画质',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: colors.onSurfaceVariant,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(width: 12),
+              FilledButton.icon(
+                key: const ValueKey('download-selected-dramas'),
+                onPressed: count == 0 ? null : _downloadSelected,
+                style: FilledButton.styleFrom(
+                  minimumSize: const Size(0, 48),
+                  padding: const EdgeInsets.symmetric(horizontal: 20),
+                ),
+                icon: const Icon(LucideIcons.arrowDownToLine, size: 18),
+                label: const Text('下一步'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _selectionBar({bool safeBottom = true}) {
+    if (safeBottom && glassDesign(context)) return _glassSelectionBar();
     final theme = Theme.of(context);
     final count = _selectedDramas.length;
     return Material(
@@ -1486,20 +1818,20 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget _televisionGrid(
     List<Drama> items,
     double width, {
-    required String key,
     ScrollController? controller,
     Widget? footer,
   }) {
     final columns = ((width - 36) / 150).floor().clamp(1, 8);
     final tileWidth = (width - 36 - (columns - 1) * 14) / columns;
     return RemoteGrid(
-      key: ValueKey('tv-grid-$key'),
+      key: _gridKey,
       itemKeys: items.map((item) => item.id).toList(),
       columns: columns,
       itemExtent: DramaTile.extentFor(context, tileWidth - 14) + 14,
       controller: controller,
       footer: footer,
       padding: const EdgeInsets.fromLTRB(18, 2, 18, 18),
+      onExitUp: () => _filtersKey.currentState?.focusCurrent(),
       itemBuilder: (_, index, node, onFocus) =>
           _catalogTile(items[index], focusNode: node, onFocus: onFocus),
     );

@@ -6,25 +6,11 @@ import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:media_kit/media_kit.dart';
 
-import 'app_layout.dart';
-import 'widgets.dart';
-
-enum SwipeAction { none, brightness, episode, seek }
-
-class GestureHudState {
-  const GestureHudState({
-    this.type = SwipeAction.none,
-    this.value = 0.0,
-    this.label,
-    this.sub,
-  });
-  final SwipeAction type;
-  final double value; // 0.0 ~ 1.0
-  final String? label;
-  final String? sub;
-}
+enum _DragMode { none, seek, brightness }
 
 class PlayerInteractions extends ChangeNotifier {
+  static const double boostRate = 2;
+
   PlayerInteractions({
     required this.player,
     required this.available,
@@ -33,16 +19,12 @@ class PlayerInteractions extends ChangeNotifier {
     required this.onFullscreen,
     required this.onEpisode,
     this.onSeek,
+    this.onBrightness,
+    this.currentBrightness,
   }) {
     _playing = player.stream.playing.listen((playing) {
       if (!playing) cancel();
     });
-    AppDevice.getBrightness().then((val) {
-      if (!_disposed) {
-        _brightness = val;
-        notifyListeners();
-      }
-    }).catchError((_) {});
   }
 
   final Player player;
@@ -52,6 +34,8 @@ class PlayerInteractions extends ChangeNotifier {
   final VoidCallback onFullscreen;
   final String Function(int direction) onEpisode;
   final Future<void> Function(Duration)? onSeek;
+  final Future<void> Function(double value)? onBrightness;
+  final double? Function()? currentBrightness;
   late final StreamSubscription<bool> _playing;
   Timer? _holdTimer;
   Timer? _hintTimer;
@@ -63,6 +47,7 @@ class PlayerInteractions extends ChangeNotifier {
   Duration _started = Duration.zero;
   double _swipeThreshold = 70;
   bool _swipeEnabled = false;
+  bool _dragEnabled = false;
   bool _moved = false;
   bool _held = false;
   bool _boosting = false;
@@ -71,47 +56,37 @@ class PlayerInteractions extends ChangeNotifier {
   bool _disposed = false;
   double _unmutedVolume = 100;
   String _feedback = '';
+  bool _feedbackRevealsControls = false;
   DateTime _ignoreTapUntil = DateTime(2000);
-  SwipeAction _swipeAction = SwipeAction.none;
-  GestureHudState _hudState = const GestureHudState();
-  double _brightness = 0.5;
-  double _initialBrightness = 0.5;
-  double _viewWidth = 0.0;
-  double _viewHeight = 0.0;
-  Duration _seekStart = Duration.zero;
-  Duration _seekTarget = Duration.zero;
-  double _secondsPerPixel = 0.5;
-  Timer? _hudTimer;
+  double _paneWidth = 0;
+  double _paneHeight = 0;
+  bool _originOnLeft = false;
+  _DragMode _dragMode = _DragMode.none;
+  Duration _seekAnchor = Duration.zero;
+  Duration? _seekPreview;
+  double _brightnessAnchor = .5;
 
-  GestureHudState get hudState => _hudState;
-  double get brightness => _brightness;
-  bool get isBrightnessActive => _hudState.type == SwipeAction.brightness;
-
-  void setBrightnessDirect(double value) {
-    if (_disposed) return;
-    _brightness = value.clamp(0.01, 1.0);
-    AppDevice.setBrightness(_brightness);
-    _showHud(SwipeAction.brightness, _brightness);
-  }
-
-  void dismissBrightnessHud() {
-    _scheduleDismissHud();
-  }
   String get feedback => _feedback;
+  bool get feedbackRevealsControls => _feedbackRevealsControls;
   bool get boosting => _boosting;
   bool get suppressTap => DateTime.now().isBefore(_ignoreTapUntil);
   Future<void> get pendingRates => _rates;
 
-  void hint(String message, {bool persistent = false}) {
+  void hint(
+    String message, {
+    bool persistent = false,
+    bool revealControls = true,
+  }) {
     if (_disposed) return;
     _hintTimer?.cancel();
+    _feedbackRevealsControls = revealControls;
     if (_feedback != message) {
       _feedback = message;
       notifyListeners();
     }
     if (!persistent && message.isNotEmpty) {
       _hintTimer = Timer(const Duration(milliseconds: 1200), () {
-        hint(_boosting ? '3 倍速 · 松开恢复' : '', persistent: true);
+        hint('', persistent: true);
       });
     }
   }
@@ -143,12 +118,13 @@ class PlayerInteractions extends ChangeNotifier {
       }
       _boosting = true;
       _held = true;
-      unawaited(_setRate(3));
-      hint('3 倍速 · 松开恢复', persistent: true);
+      unawaited(_setRate(boostRate));
+      hint('');
+      notifyListeners();
     });
   }
 
-  void _endHold({bool tap = false, bool silent = false}) {
+  void _endHold({bool tap = false}) {
     final wasKeyboard = _keyboardHold;
     final boosted = _boosting;
     _holdTimer?.cancel();
@@ -157,7 +133,7 @@ class PlayerInteractions extends ChangeNotifier {
     _boosting = false;
     if (boosted) {
       unawaited(_setRate(baseSpeed()));
-      if (!silent) hint('恢复 ${baseSpeed()} 倍速');
+      notifyListeners();
     } else if (tap && wasKeyboard) {
       seek(5);
     }
@@ -172,16 +148,17 @@ class PlayerInteractions extends ChangeNotifier {
     _pointer = null;
     _origin = null;
     _lastPosition = null;
-    _endHold(silent: true);
-    _scheduleDismissHud();
+    _dragMode = _DragMode.none;
+    _seekPreview = null;
+    _endHold();
     hint('');
   }
 
   void pointerDown(
     PointerDownEvent event, {
     required bool swipeEnabled,
-    double width = 0.0,
     required double height,
+    required double width,
   }) {
     _pointers.add(event.pointer);
     if (_pointers.length != 1 || _cancelUntilRelease) {
@@ -193,87 +170,113 @@ class PlayerInteractions extends ChangeNotifier {
     _origin = _lastPosition = event.localPosition;
     _started = event.timeStamp;
     _swipeEnabled = swipeEnabled && event.kind == PointerDeviceKind.touch;
-    _swipeThreshold = math.max(30, math.min(80, height * .08));
-    _viewWidth = width;
-    _viewHeight = height;
+    _dragEnabled =
+        _swipeEnabled &&
+        height >= 200 &&
+        width >= 240 &&
+        (onSeek != null || onBrightness != null);
+    _paneWidth = width;
+    _paneHeight = height;
+    _originOnLeft = event.localPosition.dx < width / 2;
+    _dragMode = _DragMode.none;
+    _seekAnchor = player.state.position;
+    _brightnessAnchor = (currentBrightness?.call() ?? .5).clamp(.01, 1.0);
+    _swipeThreshold = math.max(56, math.min(100, height * .1));
     _moved = _held = false;
-    _swipeAction = SwipeAction.none;
-
-    if (_swipeEnabled && width > 0) {
-      // 判定触摸落点：
-      // 左侧 35% 区域 -> 呼出并拉动红果风格亮度条
-      // 其余区域 -> 刷剧切集，绝对不调节音量
-      if (event.localPosition.dx < width * 0.35) {
-        _swipeAction = SwipeAction.brightness;
-        AppDevice.getBrightness().then((val) {
-          if (_pointer == event.pointer &&
-              _swipeAction == SwipeAction.brightness) {
-            _initialBrightness = _brightness = val;
-            _showHud(SwipeAction.brightness, _brightness);
-          }
-        });
-      } else {
-        _swipeAction = SwipeAction.episode;
-      }
-    }
     _beginHold();
   }
 
   void pointerMove(PointerMoveEvent event) {
     if (_pointer != event.pointer || _origin == null) return;
     _lastPosition = event.localPosition;
-    final diff = event.localPosition - _origin!;
-    if (diff.distance > 12) {
+    final delta = event.localPosition - _origin!;
+    if (delta.distance > 12) {
       _moved = true;
       _endHold();
     }
-    if (!_swipeEnabled || !_moved || _viewHeight <= 0) return;
-
-    final dx = event.localPosition.dx - _origin!.dx;
-    final dy = _origin!.dy - event.localPosition.dy; // 向上滑动为增加，向下为减少
-
-    // 横向滑动（任意落点）：进入快进/后退预览，松手后才真正跳转。
-    if (_swipeAction != SwipeAction.seek &&
-        dx.abs() >= _swipeThreshold &&
-        dx.abs() > dy.abs() * 1.2 &&
-        player.state.duration > Duration.zero) {
-      _swipeAction = SwipeAction.seek;
-      _seekStart = player.state.position;
-      final durationSeconds = player.state.duration.inMilliseconds / 1000;
-      _secondsPerPixel = (_viewWidth > 0
-              ? durationSeconds / _viewWidth * 0.5
-              : 0.5)
-          .clamp(0.25, 3.0);
+    if (!_dragEnabled) return;
+    if (_dragMode == _DragMode.none) {
+      _maybeBeginDrag(delta, event.timeStamp - _started);
     }
-    if (_swipeAction == SwipeAction.seek) {
-      final durationMs = player.state.duration.inMilliseconds;
-      final target = (_seekStart.inMilliseconds +
-              dx * _secondsPerPixel * 1000)
-          .round()
-          .clamp(0, durationMs)
-          .toInt();
-      _seekTarget = Duration(milliseconds: target);
-      final deltaSeconds = ((target - _seekStart.inMilliseconds) / 1000)
-          .round();
-      _showHud(
-        SwipeAction.seek,
-        durationMs > 0 ? target / durationMs : 0,
-        label: deltaSeconds >= 0
-            ? '快进 ${deltaSeconds.abs()} 秒'
-            : '后退 ${deltaSeconds.abs()} 秒',
-        sub: '${formatPosition(target / 1000)} / '
-            '${formatPosition(durationMs / 1000)}',
-      );
+    switch (_dragMode) {
+      case _DragMode.seek:
+        _updateSeekDrag(delta);
+      case _DragMode.brightness:
+        _updateBrightnessDrag(delta);
+      case _DragMode.none:
+        break;
+    }
+  }
+
+  // 手势分层：水平拖动 = 进度快退/快进；左半屏"慢速"垂直拖动 = 系统亮度临时调整。
+  // 亮度手势要求按住超过 260 毫秒才激活，快速竖直 flick 仍走原有的上下滑动切集；
+  // 右半屏垂直手势完全不改动，保留切集行为。
+  void _maybeBeginDrag(Offset delta, Duration elapsed) {
+    if (!_moved || _dragMode != _DragMode.none) return;
+    final horizontal =
+        delta.dx.abs() > 24 && delta.dx.abs() > delta.dy.abs() * 1.2;
+    final vertical = delta.dy.abs() > 24 && delta.dy.abs() > delta.dx.abs() * 1.2;
+    if (horizontal && player.state.duration > Duration.zero) {
+      _dragMode = _DragMode.seek;
+      _seekAnchor = player.state.position;
+      _clearHold();
       return;
     }
-
-    final deltaRatio = dy / (_viewHeight * 0.6);
-
-    if (_swipeAction == SwipeAction.brightness) {
-      _brightness = (_initialBrightness + deltaRatio).clamp(0.01, 1.0);
-      AppDevice.setBrightness(_brightness);
-      _showHud(SwipeAction.brightness, _brightness);
+    if (vertical &&
+        _originOnLeft &&
+        onBrightness != null &&
+        elapsed > const Duration(milliseconds: 260)) {
+      _dragMode = _DragMode.brightness;
+      _brightnessAnchor = (currentBrightness?.call() ?? .5).clamp(.01, 1.0);
+      _clearHold();
     }
+  }
+
+  void _clearHold() {
+    _holdTimer?.cancel();
+    _holdTimer = null;
+    _keyboardHold = false;
+    if (_boosting) {
+      _boosting = false;
+      unawaited(_setRate(baseSpeed()));
+      notifyListeners();
+    }
+    _held = false;
+  }
+
+  // 全屏横向拖完一整屏 ≈ 进度全幅；短剧时长普遍 < 1 小时，按 min(时长, 45 分钟)
+  // 缩放，保证小屏手机上能拖到位又不至于太灵敏。
+  void _updateSeekDrag(Offset delta) {
+    final duration = player.state.duration;
+    if (duration <= Duration.zero || _paneWidth <= 0) return;
+    final span = duration > const Duration(minutes: 45)
+        ? const Duration(minutes: 45)
+        : duration;
+    final fraction = (delta.dx / _paneWidth).clamp(-1.0, 1.0);
+    var target = _seekAnchor +
+        Duration(microseconds: (span.inMicroseconds * fraction).round());
+    if (target < Duration.zero) target = Duration.zero;
+    if (target > duration) target = duration;
+    _seekPreview = target;
+    final shift = target - _seekAnchor;
+    final sign = shift >= Duration.zero ? '+' : '-';
+    hint(
+      '${_formatPosition(target)} / ${_formatPosition(duration)}\n'
+      '$sign${_formatDuration(shift.abs())}',
+      persistent: true,
+      revealControls: false,
+    );
+  }
+
+  void _updateBrightnessDrag(Offset delta) {
+    if (_paneHeight <= 0) return;
+    final value = (_brightnessAnchor - delta.dy / _paneHeight).clamp(.01, 1.0);
+    unawaited(onBrightness?.call(value));
+    hint(
+      '亮度 ${(value * 100).round()}%',
+      persistent: true,
+      revealControls: false,
+    );
   }
 
   void pointerUp(PointerUpEvent event) {
@@ -285,36 +288,37 @@ class PlayerInteractions extends ChangeNotifier {
     }
     if (_pointer != event.pointer || _origin == null) return;
     final delta = (_lastPosition ?? event.localPosition) - _origin!;
-    final isVertical = delta.dy.abs() >= _swipeThreshold && delta.dy.abs() > delta.dx.abs() * 1.5;
-
-    if (_swipeAction == SwipeAction.seek) {
-      _scheduleDismissHud();
-      if (_swipeEnabled &&
-          !_held &&
-          _moved &&
-          available() &&
-          _seekTarget != _seekStart) {
-        final seconds = (_seekTarget - _seekStart).inMilliseconds / 1000;
-        unawaited((onSeek ?? player.seek)(_seekTarget));
-        hint('${seconds >= 0 ? '已快进' : '已后退'} ${seconds.abs().round()} 秒');
+    final mode = _dragMode;
+    _pointer = null;
+    _origin = null;
+    _dragMode = _DragMode.none;
+    _endHold();
+    if (_moved || _held || mode != _DragMode.none) {
+      _ignoreTapUntil = DateTime.now().add(const Duration(milliseconds: 600));
+    }
+    if (mode == _DragMode.seek) {
+      final target = _seekPreview;
+      _seekPreview = null;
+      hint('', persistent: true, revealControls: false);
+      if (target != null && available()) {
+        unawaited((onSeek ?? player.seek)(target).catchError((Object _) {}));
       }
-    } else if (_swipeAction == SwipeAction.episode &&
+      return;
+    }
+    if (mode == _DragMode.brightness) {
+      hint('', persistent: true, revealControls: false);
+      return;
+    }
+    final swipe =
         _swipeEnabled &&
         !_held &&
         _moved &&
-        isVertical &&
-        event.timeStamp - _started < const Duration(milliseconds: 1500)) {
-      if (available()) hint(onEpisode(delta.dy < 0 ? 1 : -1));
-    } else if (_swipeAction == SwipeAction.brightness) {
-      _scheduleDismissHud();
+        delta.dy.abs() >= _swipeThreshold &&
+        delta.dy.abs() > delta.dx.abs() * 1.5 &&
+        event.timeStamp - _started < const Duration(milliseconds: 1500);
+    if (swipe && available()) {
+      hint(onEpisode(delta.dy < 0 ? 1 : -1), revealControls: false);
     }
-
-    if (_moved || _held) {
-      _ignoreTapUntil = DateTime.now().add(const Duration(milliseconds: 600));
-    }
-    _pointer = null;
-    _origin = null;
-    _endHold();
   }
 
   void pointerCancel(PointerCancelEvent event) {
@@ -324,39 +328,13 @@ class PlayerInteractions extends ChangeNotifier {
     if (_pointers.isEmpty) _cancelUntilRelease = false;
   }
 
-  void _showHud(
-    SwipeAction action,
-    double value, {
-    String? label,
-    String? sub,
-  }) {
-    if (_disposed) return;
-    _hudTimer?.cancel();
-    _hudState = GestureHudState(
-      type: action,
-      value: value,
-      label: label,
-      sub: sub,
-    );
-    notifyListeners();
-  }
-
-  void _scheduleDismissHud() {
-    _hudTimer?.cancel();
-    _hudTimer = Timer(const Duration(milliseconds: 1000), () {
-      if (_disposed) return;
-      _hudState = const GestureHudState();
-      notifyListeners();
-    });
-  }
-
   void seek(int seconds) {
     if (!available() || player.state.duration <= Duration.zero) return;
     _endHold();
     final target = (player.state.position.inMilliseconds + seconds * 1000)
         .clamp(0, player.state.duration.inMilliseconds);
     unawaited((onSeek ?? player.seek)(Duration(milliseconds: target)));
-    hint('${seconds > 0 ? '快进至' : '后退至'} ${formatPosition(target / 1000)}');
+    hint('', persistent: true, revealControls: false);
   }
 
   void changeVolume(double delta) {
@@ -419,7 +397,10 @@ class PlayerInteractions extends ChangeNotifier {
     } else if (key == LogicalKeyboardKey.mediaTrackNext ||
         key == LogicalKeyboardKey.mediaTrackPrevious) {
       if (event is KeyDownEvent) {
-        hint(onEpisode(key == LogicalKeyboardKey.mediaTrackNext ? 1 : -1));
+        hint(
+          onEpisode(key == LogicalKeyboardKey.mediaTrackNext ? 1 : -1),
+          revealControls: false,
+        );
       }
     } else {
       return KeyEventResult.ignored;
@@ -427,13 +408,25 @@ class PlayerInteractions extends ChangeNotifier {
     return KeyEventResult.handled;
   }
 
+  static String _formatPosition(Duration value) {
+    final hours = value.inHours;
+    final minutes = value.inMinutes.remainder(60);
+    final seconds = value.inSeconds.remainder(60);
+    String two(int v) => v.toString().padLeft(2, '0');
+    return hours > 0 ? '$hours:${two(minutes)}:${two(seconds)}' : '${two(minutes)}:${two(seconds)}';
+  }
+
+  static String _formatDuration(Duration value) {
+    final minutes = value.inMinutes;
+    final seconds = value.inSeconds.remainder(60);
+    return minutes > 0 ? '$minutes 分 $seconds 秒' : '$seconds 秒';
+  }
+
   @override
   void dispose() {
     _disposed = true;
     _holdTimer?.cancel();
     _hintTimer?.cancel();
-    _hudTimer?.cancel();
-    AppDevice.resetBrightness(); // 离开播放器时自动恢复手机/平板系统默认亮度
     if (_boosting) unawaited(_setRate(baseSpeed()));
     _boosting = false;
     _playing.cancel();

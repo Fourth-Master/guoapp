@@ -3,7 +3,6 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:media_kit/media_kit.dart';
 
-import 'app_layout.dart';
 import 'lan_controller.dart';
 import 'player_interactions.dart';
 import 'widgets.dart';
@@ -34,11 +33,18 @@ class PlayerControls extends StatefulWidget {
     this.danmakuStatus = '',
     this.swipeEnabled = false,
     this.panelOpen = false,
+    this.pageFullscreen = false,
+    this.windowFullscreen = false,
+    this.onPageFullscreen,
+    this.onExitFullscreen,
     this.onSeek,
     this.onDanmaku,
     this.onRetryDanmaku,
     this.onPush,
     this.onPictureInPicture,
+    this.routeLabel = '',
+    this.routeCount = 1,
+    this.onRoute,
     this.enhancement,
   });
 
@@ -46,8 +52,12 @@ class PlayerControls extends StatefulWidget {
   final PlayerInteractions interactions;
   final bool enabled;
   final bool fullscreen;
+  final bool pageFullscreen;
+  final bool windowFullscreen;
   final bool showOnPlaybackReady;
   final VoidCallback onFullscreen;
+  final VoidCallback? onPageFullscreen;
+  final VoidCallback? onExitFullscreen;
   final VoidCallback onBack;
   final VoidCallback? onPrevious;
   final VoidCallback? onNext;
@@ -69,6 +79,9 @@ class PlayerControls extends StatefulWidget {
   final Future<void> Function()? onRetryDanmaku;
   final Future<void> Function()? onPush;
   final Future<void> Function()? onPictureInPicture;
+  final String routeLabel;
+  final int routeCount;
+  final VoidCallback? onRoute;
   final VideoEnhancementController? enhancement;
 
   @override
@@ -78,10 +91,14 @@ class PlayerControls extends StatefulWidget {
 class _PlayerControlsState extends State<PlayerControls> {
   final List<StreamSubscription<dynamic>> _subscriptions = [];
   Timer? _hideTimer;
+  Timer? _progressTimer;
   bool _visible = true;
   bool _suppressAutoPlaybackStart = false;
   bool _lastPlaying = false;
+  bool _pausedBeforeResume = false;
   double? _seekValue;
+
+  bool get _controlsVisible => _visible || widget.panelOpen;
 
   @override
   void initState() {
@@ -93,25 +110,33 @@ class _PlayerControlsState extends State<PlayerControls> {
       widget.player.stream.position,
       widget.player.stream.duration,
       widget.player.stream.buffer,
-      widget.player.stream.playing,
-      widget.player.stream.buffering,
       widget.player.stream.volume,
     ]) {
-      _subscriptions.add(
-        stream.listen((_) {
-          if (mounted) setState(() {});
-        }),
-      );
+      _subscriptions.add(stream.listen((_) => _scheduleProgressRefresh()));
     }
     _subscriptions.add(
-      widget.player.stream.playing.listen((playing) {
+      widget.player.stream.buffering.distinct().listen((_) {
+        if (!mounted) return;
+        setState(() {});
+        _scheduleHide();
+      }),
+    );
+    _subscriptions.add(
+      widget.player.stream.playing.distinct().listen((playing) {
         final wasPlaying = _lastPlaying;
         _lastPlaying = playing;
         if (!mounted || !widget.enabled) return;
+        setState(() {});
         if (!playing) {
-          _show();
+          if (wasPlaying && !widget.player.state.buffering) {
+            _pausedBeforeResume = true;
+            _show();
+          }
         } else if (!wasPlaying) {
-          if (_suppressAutoPlaybackStart) {
+          if (_pausedBeforeResume) {
+            _pausedBeforeResume = false;
+            _hide();
+          } else if (_suppressAutoPlaybackStart) {
             _suppressAutoPlaybackStart = false;
             _scheduleHide();
           } else {
@@ -130,6 +155,8 @@ class _PlayerControlsState extends State<PlayerControls> {
     if (widget.enabled != oldWidget.enabled ||
         widget.panelOpen != oldWidget.panelOpen ||
         widget.fullscreen != oldWidget.fullscreen ||
+        widget.pageFullscreen != oldWidget.pageFullscreen ||
+        widget.windowFullscreen != oldWidget.windowFullscreen ||
         widget.showOnPlaybackReady != oldWidget.showOnPlaybackReady) {
       _seekValue = null;
       if (widget.showOnPlaybackReady) {
@@ -138,6 +165,7 @@ class _PlayerControlsState extends State<PlayerControls> {
         _suppressAutoPlaybackStart = !widget.player.state.playing;
       } else if (!widget.enabled && oldWidget.enabled) {
         _suppressAutoPlaybackStart = true;
+        _pausedBeforeResume = false;
         _visible = false;
       }
       if (widget.enabled && !oldWidget.enabled) {
@@ -147,7 +175,9 @@ class _PlayerControlsState extends State<PlayerControls> {
           _visible = false;
         }
       } else if (widget.panelOpen != oldWidget.panelOpen ||
-          widget.fullscreen != oldWidget.fullscreen) {
+          widget.fullscreen != oldWidget.fullscreen ||
+          widget.pageFullscreen != oldWidget.pageFullscreen ||
+          widget.windowFullscreen != oldWidget.windowFullscreen) {
         _visible = true;
       }
       _scheduleHide();
@@ -155,12 +185,28 @@ class _PlayerControlsState extends State<PlayerControls> {
   }
 
   void _interactionChanged() {
-    if (mounted && widget.interactions.feedback.isNotEmpty) _show();
+    if (!mounted) return;
+    if (widget.interactions.boosting) {
+      _hideTimer?.cancel();
+      setState(() => _visible = false);
+    } else if (widget.interactions.feedback.isNotEmpty &&
+        widget.interactions.feedbackRevealsControls) {
+      _show();
+    }
+  }
+
+  void _scheduleProgressRefresh() {
+    if (!mounted || !_controlsVisible || _progressTimer != null) return;
+    _progressTimer = Timer(const Duration(milliseconds: 250), () {
+      _progressTimer = null;
+      if (mounted && _controlsVisible) setState(() {});
+    });
   }
 
   void _scheduleHide() {
     _hideTimer?.cancel();
-    if (!widget.enabled ||
+    if (!_visible ||
+        !widget.enabled ||
         widget.panelOpen ||
         !widget.player.state.playing ||
         _seekValue != null) {
@@ -185,11 +231,22 @@ class _PlayerControlsState extends State<PlayerControls> {
     _scheduleHide();
   }
 
+  void _hide() {
+    _hideTimer?.cancel();
+    if (_visible) setState(() => _visible = false);
+  }
+
   void _tap() {
     if (widget.interactions.suppressTap) return;
     widget.onFocusSurface();
     setState(() => _visible = !_visible);
     _scheduleHide();
+  }
+
+  void _doubleTap() {
+    if (!widget.enabled || widget.interactions.suppressTap) return;
+    widget.onFocusSurface();
+    widget.onTogglePlayback();
   }
 
   Future<void> _panel(Future<void> Function() open) async {
@@ -202,6 +259,7 @@ class _PlayerControlsState extends State<PlayerControls> {
   @override
   void dispose() {
     _hideTimer?.cancel();
+    _progressTimer?.cancel();
     widget.interactions.removeListener(_interactionChanged);
     for (final subscription in _subscriptions) {
       subscription.cancel();
@@ -215,110 +273,114 @@ class _PlayerControlsState extends State<PlayerControls> {
     final duration = state.duration.inMilliseconds / 1000;
     final position = state.position.inMilliseconds / 1000;
     final buffered = state.buffer.inMilliseconds / 1000;
-    final visible =
-        _visible || !state.playing || state.buffering || widget.panelOpen;
-    return MouseRegion(
-      onHover: (_) => _show(),
-      cursor: visible ? SystemMouseCursors.basic : SystemMouseCursors.none,
-      child: LayoutBuilder(
-        builder: (context, constraints) => Stack(
-          fit: StackFit.expand,
-          children: [
-            Listener(
-              key: const ValueKey('player-gesture-surface'),
+    final visible = _controlsVisible;
+    return LayoutBuilder(
+      builder: (context, constraints) => Stack(
+        fit: StackFit.expand,
+        children: [
+          Listener(
+            key: const ValueKey('player-gesture-surface'),
+            behavior: HitTestBehavior.opaque,
+            onPointerDown: (event) {
+              widget.onFocusSurface();
+              widget.interactions.pointerDown(
+                event,
+                swipeEnabled: widget.swipeEnabled,
+                height: constraints.maxHeight,
+                width: constraints.maxWidth,
+              );
+            },
+            onPointerMove: widget.interactions.pointerMove,
+            onPointerUp: widget.interactions.pointerUp,
+            onPointerCancel: widget.interactions.pointerCancel,
+            child: GestureDetector(
               behavior: HitTestBehavior.opaque,
-              onPointerDown: (event) {
-                widget.onFocusSurface();
-                widget.interactions.pointerDown(
-                  event,
-                  swipeEnabled: widget.swipeEnabled,
-                  width: constraints.maxWidth,
-                  height: constraints.maxHeight,
-                );
-              },
-              onPointerMove: widget.interactions.pointerMove,
-              onPointerUp: widget.interactions.pointerUp,
-              onPointerCancel: widget.interactions.pointerCancel,
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: _tap,
-                onDoubleTap: () {
-                  if (!widget.enabled || widget.interactions.suppressTap) {
-                    return;
-                  }
-                  widget.onTogglePlayback();
-                  _show();
-                },
-              ),
+              onTap: _tap,
+              onDoubleTap: widget.swipeEnabled ? _doubleTap : null,
             ),
-            if (state.buffering && widget.enabled)
-              const IgnorePointer(
-                child: Center(child: CircularProgressIndicator()),
-              ),
-            IgnorePointer(
-              ignoring: !visible,
-              child: ExcludeFocus(
-                excluding: !visible,
-                child: AnimatedOpacity(
-                  opacity: visible ? 1 : 0,
-                  duration: const Duration(milliseconds: 180),
-                  child: Stack(
-                    fit: StackFit.expand,
-                    children: [
-                      const IgnorePointer(
-                        child: DecoratedBox(
-                          decoration: BoxDecoration(
-                            gradient: LinearGradient(
-                              begin: Alignment.topCenter,
-                              end: Alignment.bottomCenter,
-                              colors: [
-                                Color(0xAA000000),
-                                Colors.transparent,
-                                Color(0xE6000000),
-                              ],
-                              stops: [0, .45, 1],
-                            ),
+          ),
+          if (!widget.swipeEnabled) _bottomRevealRegion(),
+          if (state.buffering && widget.enabled)
+            const IgnorePointer(
+              child: Center(child: CircularProgressIndicator()),
+            ),
+          IgnorePointer(
+            ignoring: !visible,
+            child: ExcludeFocus(
+              excluding: !visible,
+              child: AnimatedOpacity(
+                opacity: visible ? 1 : 0,
+                duration: const Duration(milliseconds: 180),
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    const IgnorePointer(
+                      child: DecoratedBox(
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            begin: Alignment.topCenter,
+                            end: Alignment.bottomCenter,
+                            colors: [
+                              Color(0xAA000000),
+                              Colors.transparent,
+                              Color(0xE6000000),
+                            ],
+                            stops: [0, .45, 1],
                           ),
                         ),
                       ),
-                      Padding(
-                        padding: EdgeInsets.fromLTRB(
-                          8,
-                          _topChromeInset(),
-                          8,
-                          _bottomChromeInset(),
-                        ),
-                        child: Stack(
-                          children: [
-                            if (widget.fullscreen || widget.swipeEnabled)
-                              _topBar(),
-                            if (!state.buffering &&
-                                widget.enabled &&
-                                constraints.maxHeight >=
-                                    (widget.swipeEnabled ? 168 : 220))
-                              _centerPlayback(state.playing, showSkip: true),
-                            _sideDanmakuControl(),
-                            _bottomControls(
-                              constraints: constraints,
-                              volume: state.volume,
-                              duration: duration,
-                              position: position,
-                              buffered: buffered,
-                            ),
-                          ],
-                        ),
+                    ),
+                    Padding(
+                      padding: EdgeInsets.fromLTRB(
+                        8,
+                        _topChromeInset(),
+                        8,
+                        _bottomChromeInset(),
                       ),
-                    ],
-                  ),
+                      child: Stack(
+                        children: [
+                          if (widget.fullscreen || widget.swipeEnabled)
+                            _topBar(),
+                          if (!state.buffering &&
+                              widget.enabled &&
+                              constraints.maxHeight >=
+                                  (widget.swipeEnabled ? 168 : 220))
+                            _centerPlayback(state.playing, showSkip: true),
+                          _sideDanmakuControl(),
+                          _bottomControls(
+                            constraints: constraints,
+                            volume: state.volume,
+                            duration: duration,
+                            position: position,
+                            buffered: buffered,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
                 ),
               ),
             ),
-            _gestureFeedback(),
-          ],
-        ),
+          ),
+          _gestureFeedback(),
+          _boostBadge(),
+        ],
       ),
     );
   }
+
+  Widget _bottomRevealRegion() => Positioned(
+    left: 0,
+    right: 0,
+    bottom: 0,
+    height: 72,
+    child: MouseRegion(
+      opaque: false,
+      hitTestBehavior: HitTestBehavior.translucent,
+      onHover: (_) => _show(),
+      child: const SizedBox.expand(),
+    ),
+  );
 
   Widget _topBar() {
     final compact = widget.swipeEnabled && !widget.fullscreen;
@@ -331,7 +393,7 @@ class _PlayerControlsState extends State<PlayerControls> {
             _overlayIconButton(
               tooltip: widget.fullscreen ? '退出全屏' : '返回',
               onPressed: widget.fullscreen
-                  ? widget.onFullscreen
+                  ? (widget.onExitFullscreen ?? widget.onFullscreen)
                   : widget.onBack,
               icon: widget.fullscreen
                   ? Icons.arrow_back_rounded
@@ -343,6 +405,7 @@ class _PlayerControlsState extends State<PlayerControls> {
                   widget.title,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: Colors.white),
                 ),
               )
             else
@@ -434,7 +497,7 @@ class _PlayerControlsState extends State<PlayerControls> {
     final width = constraints.maxWidth;
     final fullscreen = widget.fullscreen;
     final mobile = widget.swipeEnabled;
-    final showEpisodes = fullscreen;
+    final showEpisodes = !mobile;
     final showSpeedQuality =
         mobile || fullscreen && width >= 720 || !fullscreen && width >= 560;
     final showPush =
@@ -740,6 +803,17 @@ class _PlayerControlsState extends State<PlayerControls> {
           ),
   );
 
+  Widget? _routeTool() {
+    if (widget.onRoute == null || widget.routeCount <= 1) return null;
+    return _toolText(
+      key: const ValueKey('player-route'),
+      tooltip: '播放线路',
+      label: widget.routeLabel,
+      onPressed: widget.enabled ? widget.onRoute : null,
+      width: 64,
+    );
+  }
+
   Widget _desktopControlRow({
     required bool fullscreen,
     required bool showEpisodes,
@@ -749,6 +823,7 @@ class _PlayerControlsState extends State<PlayerControls> {
     required bool showVolume,
     required double volume,
   }) {
+    final routeTool = _routeTool();
     final tools = [
       if (showSpeedQuality) ...[
         _toolText(
@@ -765,6 +840,7 @@ class _PlayerControlsState extends State<PlayerControls> {
           onPressed: widget.enabled ? () => _panel(widget.onQuality) : null,
           width: 52,
         ),
+        if (routeTool != null) routeTool,
       ],
       if (showPush) _lanPushTool(const ValueKey('fullscreen-lan-push')),
       if (showEpisodes)
@@ -795,10 +871,19 @@ class _PlayerControlsState extends State<PlayerControls> {
               ? () => _panel(widget.onPictureInPicture!)
               : null,
         ),
+      if (widget.onPageFullscreen != null)
+        _toolIcon(
+          key: const ValueKey('player-page-fullscreen'),
+          tooltip: widget.pageFullscreen ? '退出页面全屏' : '页面全屏',
+          icon: widget.pageFullscreen
+              ? Icons.fit_screen_rounded
+              : Icons.fit_screen_outlined,
+          onPressed: widget.onPageFullscreen,
+        ),
       _toolIcon(
         key: const ValueKey('player-fullscreen'),
-        tooltip: fullscreen ? '退出全屏' : '旋转与全屏',
-        icon: fullscreen
+        tooltip: widget.windowFullscreen ? '退出窗口全屏' : '窗口全屏',
+        icon: widget.windowFullscreen
             ? Icons.fullscreen_exit_rounded
             : Icons.fullscreen_rounded,
         onPressed: widget.onFullscreen,
@@ -811,6 +896,7 @@ class _PlayerControlsState extends State<PlayerControls> {
   }
 
   Widget _mobileControlRow({required bool fullscreen}) {
+    final routeTool = _routeTool();
     final tools = [
       _toolText(
         key: const ValueKey('player-speed'),
@@ -826,6 +912,7 @@ class _PlayerControlsState extends State<PlayerControls> {
         onPressed: widget.enabled ? () => _panel(widget.onQuality) : null,
         width: 52,
       ),
+      if (routeTool != null) routeTool,
       if (widget.onPush != null)
         _lanPushTool(const ValueKey('fullscreen-lan-push')),
       if (fullscreen)
@@ -990,137 +1077,7 @@ class _PlayerControlsState extends State<PlayerControls> {
   Widget _gestureFeedback() => AnimatedBuilder(
     animation: widget.interactions,
     builder: (context, _) {
-      final hud = widget.interactions.hudState;
       final feedback = widget.interactions.feedback;
-      if (hud.type == SwipeAction.seek) {
-        final forward = (hud.label ?? '').startsWith('快进');
-        return IgnorePointer(
-          child: Center(
-            child: Container(
-              padding: const EdgeInsets.symmetric(vertical: 18, horizontal: 22),
-              decoration: BoxDecoration(
-                color: Colors.black.withValues(alpha: .75),
-                borderRadius: BorderRadius.circular(16),
-                border: Border.all(
-                  color: Colors.white.withValues(alpha: .15),
-                  width: 1,
-                ),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withValues(alpha: .4),
-                    blurRadius: 18,
-                    spreadRadius: 2,
-                  ),
-                ],
-              ),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(
-                    forward
-                        ? Icons.fast_forward_rounded
-                        : Icons.fast_rewind_rounded,
-                    color: Colors.white,
-                    size: 34,
-                  ),
-                  const SizedBox(height: 12),
-                  Text(
-                    hud.label ?? '',
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 15,
-                      fontWeight: FontWeight.bold,
-                      letterSpacing: 0.5,
-                    ),
-                  ),
-                  const SizedBox(height: 6),
-                  Text(
-                    hud.sub ?? '',
-                    style: TextStyle(
-                      color: Colors.white.withValues(alpha: .78),
-                      fontSize: 12,
-                      fontFeatures: const [FontFeature.tabularFigures()],
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  SizedBox(
-                    width: 86,
-                    height: 4,
-                    child: ClipRRect(
-                      borderRadius: BorderRadius.circular(2),
-                      child: LinearProgressIndicator(
-                        value: hud.value.clamp(0.0, 1.0),
-                        backgroundColor: Colors.white24,
-                        valueColor: const AlwaysStoppedAnimation<Color>(
-                          Colors.white,
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        );
-      }
-      if (hud.type == SwipeAction.brightness) {
-        final value = hud.value.clamp(0.0, 1.0);
-        final percent = (value * 100).round();
-        final icon = value < 0.33
-            ? Icons.brightness_low_rounded
-            : value < 0.66
-                ? Icons.brightness_medium_rounded
-                : Icons.brightness_high_rounded;
-        return IgnorePointer(
-          child: Center(
-            child: Container(
-              width: 120,
-              padding: const EdgeInsets.symmetric(vertical: 18, horizontal: 16),
-              decoration: BoxDecoration(
-                color: Colors.black.withValues(alpha: .75),
-                borderRadius: BorderRadius.circular(16),
-                border: Border.all(color: Colors.white.withValues(alpha: .15), width: 1),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withValues(alpha: .4),
-                    blurRadius: 18,
-                    spreadRadius: 2,
-                  ),
-                ],
-              ),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(icon, color: Colors.white, size: 36),
-                  const SizedBox(height: 14),
-                  SizedBox(
-                    width: 70,
-                    height: 6,
-                    child: ClipRRect(
-                      borderRadius: BorderRadius.circular(3),
-                      child: LinearProgressIndicator(
-                        value: value,
-                        backgroundColor: Colors.white24,
-                        valueColor: const AlwaysStoppedAnimation<Color>(Colors.white),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  Text(
-                    '亮度 $percent%',
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 14,
-                      fontWeight: FontWeight.bold,
-                      letterSpacing: 0.5,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        );
-      }
       if (feedback.isEmpty) return const SizedBox.shrink();
       return IgnorePointer(
         child: Align(
@@ -1130,13 +1087,69 @@ class _PlayerControlsState extends State<PlayerControls> {
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
             decoration: BoxDecoration(
               color: Colors.black87,
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: Colors.white12),
+              borderRadius: BorderRadius.circular(10),
             ),
             child: Text(
               feedback,
               textAlign: TextAlign.center,
-              style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 14,
+                height: 1.2,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        ),
+      );
+    },
+  );
+
+  Widget _boostBadge() => AnimatedBuilder(
+    animation: widget.interactions,
+    builder: (context, _) {
+      final boosting = widget.interactions.boosting && widget.enabled;
+      return IgnorePointer(
+        child: AnimatedOpacity(
+          key: const ValueKey('player-boost-badge'),
+          opacity: boosting ? 1 : 0,
+          duration: const Duration(milliseconds: 150),
+          child: Align(
+            alignment: Alignment.topRight,
+            child: Padding(
+              padding: EdgeInsets.only(top: _topChromeInset() + 6, right: 12),
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: .34),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 4,
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(
+                        Icons.fast_forward_rounded,
+                        size: 14,
+                        color: Colors.white70,
+                      ),
+                      const SizedBox(width: 3),
+                      Text(
+                        '${PlayerInteractions.boostRate.toStringAsFixed(1)}x',
+                        style: const TextStyle(
+                          color: Colors.white70,
+                          fontSize: 12,
+                          height: 1,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
             ),
           ),
         ),

@@ -38,3 +38,16 @@ ios/Flutter/flutter_export_environment.sh
 ios/Runner/GeneratedPluginRegistrant.*
 ios/DuanjuCore/*.xcframework/
 **/xcuserdata/
+macos/Pods/
+macos/Flutter/ephemeral/
+macos/Flutter/Generated.xcconfig
+macos/Flutter/flutter_export_environment.sh
+macos/Runner/GeneratedPluginRegistrant.*
+macos/Signing/
+
+# 本地 go build ./server 产生的可执行文件
+native/server.exe
+native/server.exe~
+
+# 本机构建产物不入库
+artifacts/

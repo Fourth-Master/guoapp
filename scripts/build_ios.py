@@ -2,16 +2,56 @@ import argparse
 import hashlib
 import os
 import platform
+import plistlib
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 from app_build import BuildVariant, add_variant_argument
 
 root = Path(__file__).resolve().parents[1]
+
+
+def ios_artifact_name(variant, version, signed):
+    suffix = 'ios.ipa' if signed else 'ios-unsigned.ipa'
+    return f'{variant.slug}-{version}-{suffix}'
+
+
+def package_unsigned_ipa(application, destination):
+    if not application.is_dir():
+        raise ValueError('iOS 应用目录不存在')
+    try:
+        info = plistlib.loads((application / 'Info.plist').read_bytes())
+    except (OSError, plistlib.InvalidFileException, ValueError) as error:
+        raise ValueError('iOS 应用缺少有效 Info.plist') from error
+    executable = info.get('CFBundleExecutable', '')
+    if (not isinstance(executable, str) or not executable or Path(executable).name != executable
+            or not (application / executable).is_file()):
+        raise ValueError('iOS 应用缺少有效主程序')
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + '.tmp')
+    temporary.unlink(missing_ok=True)
+    try:
+        with zipfile.ZipFile(temporary, 'w', zipfile.ZIP_DEFLATED) as archive:
+            for source in sorted(application.rglob('*')):
+                name = 'Payload/' + application.name + '/' + source.relative_to(application).as_posix()
+                if source.is_symlink():
+                    entry = zipfile.ZipInfo(name)
+                    entry.create_system = 3
+                    entry.external_attr = source.lstat().st_mode << 16
+                    archive.writestr(entry, os.readlink(source))
+                else:
+                    archive.write(source, name)
+        with zipfile.ZipFile(temporary) as archive:
+            if archive.testzip() is not None:
+                raise ValueError('iOS IPA 完整性校验失败')
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def run(arguments, **kwargs):
@@ -68,7 +108,7 @@ def build_core(simulator=False, variant=BuildVariant()):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='构建红果鉴 / 真果鉴 iOS 核心和应用')
+    parser = argparse.ArgumentParser(description='构建短剧视界 / 全剧视界 iOS 核心和应用')
     parser.add_argument('--core-only', action='store_true')
     parser.add_argument('--simulator', action='store_true', help='额外生成模拟器核心；不启动模拟器')
     parser.add_argument('--export-options', type=Path, help='使用自己的 Xcode 签名配置导出 IPA')
@@ -81,9 +121,7 @@ def main():
     flutter = shutil.which('flutter')
     if not flutter or not shutil.which('pod'):
         raise SystemExit('请安装 Flutter 和 CocoaPods。')
-    # pubspec.yaml 与 pubspec.lock 不同步（作者最后一次提交只改了 yaml），
-    # 与 build_android.py 一致使用普通 pub get 重新解析。
-    run([flutter, 'pub', 'get'])
+    run([flutter, 'pub', 'get', '--enforce-lockfile'])
     run(['pod', 'install'], cwd=root / 'ios')
     output = root / 'dist' / 'ios'
     output.mkdir(parents=True, exist_ok=True)
@@ -95,33 +133,28 @@ def main():
             raise SystemExit('ExportOptions.plist 不存在。')
         run([flutter, 'build', 'ipa', '--release', '--no-pub', '--export-options-plist', str(config), *variant.flutter_arguments])
         for package in (root / 'build' / 'ios' / 'ipa').glob('*.ipa'):
-            destination = output / f'{variant.slug}-{version}-ios.ipa'
+            destination = output / ios_artifact_name(variant, version, signed=True)
             shutil.copy2(package, destination)
             artifacts.append(destination)
     else:
-        run([flutter, 'build', 'ios', '--release', '--no-codesign', '--no-pub', *variant.flutter_arguments])
+        environment = os.environ.copy()
+        environment.update({
+            'CODE_SIGNING_ALLOWED': 'NO',
+            'CODE_SIGNING_REQUIRED': 'NO',
+            'CODE_SIGN_IDENTITY': '',
+        })
+        run(
+            [flutter, 'build', 'ios', '--release', '--no-codesign', '--no-pub', *variant.flutter_arguments],
+            env=environment,
+        )
         application = root / 'build' / 'ios' / 'iphoneos' / 'Runner.app'
         symbols = subprocess.check_output(['xcrun', 'nm', '-gU', str(application / 'Runner')], text=True)
         for symbol in ['_DuanjuRequest', '_DuanjuFree']:
             if symbol not in symbols:
                 raise SystemExit('iOS 包缺少 FFI 入口：' + symbol)
-        destination = output / f'{variant.slug}-{version}-ios-unsigned-app.zip'
-        run(['ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', str(application), str(destination)])
+        destination = output / ios_artifact_name(variant, version, signed=False)
+        package_unsigned_ipa(application, destination)
         artifacts.append(destination)
-        # 额外打包未签名 IPA：IPA 结构为 zip 内 Payload/Runner.app。
-        # 便于用户用 AltStore / Sideloadly / TrollStore 自签后直接安装。
-        payload = output / 'Payload'
-        if payload.exists():
-            shutil.rmtree(payload)
-        payload.mkdir(parents=True)
-        shutil.copytree(application, payload / application.name, symlinks=True)
-        ipa = output / f'{variant.slug}-{version}-ios-unsigned.ipa'
-        if ipa.exists():
-            ipa.unlink()
-        # IPA 规范要求 zip 顶层为 Payload/Runner.app，--keepParent 保留 Payload 目录名。
-        run(['ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', str(payload), str(ipa)])
-        shutil.rmtree(payload)
-        artifacts.append(ipa)
     if not artifacts:
         raise SystemExit('未生成 iOS 安装包。')
     checksums = []

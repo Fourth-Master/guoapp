@@ -28,9 +28,10 @@ const (
 	sourceYeguo         = "yeguo"
 	sourceDSD           = "dsd"
 	sourceCloudFront    = "cloudfront"
-	sourceSorani        = "sorani"
 	sourceGuipian       = "guipian"
 	sourceHanxiaoquan   = "hanxiaoquan"
+	sourceIkanbot       = "ikanbot"
+	sourceA123          = "a123"
 
 	providerMaxBodyBytes = 20 * 1024 * 1024
 	providerTimeout      = 12 * time.Second
@@ -81,7 +82,19 @@ func providerChapterID(source, sourceID, chapterKey string) string {
 }
 
 func splitProviderDramaID(id string) (source, sourceID string, ok bool) {
-	source, sourceID, ok = strings.Cut(strings.TrimSpace(id), ":")
+	trimmed := strings.TrimSpace(id)
+	// 自定义源 ID 形如 custom:<hash>:<sourceID>，源名本身含冒号，需按第二个冒号拆分。
+	if strings.HasPrefix(trimmed, customSourcePrefix) {
+		if rest, tail, found := strings.Cut(strings.TrimPrefix(trimmed, customSourcePrefix), ":"); found && strings.TrimSpace(rest) != "" && strings.TrimSpace(tail) != "" {
+			source = customSourcePrefix + rest
+			if !isCustomMaccmsSource(source) {
+				return "", "", false
+			}
+			return source, strings.TrimSpace(tail), true
+		}
+		return "", "", false
+	}
+	source, sourceID, ok = strings.Cut(trimmed, ":")
 	source = canonicalProviderSource(source)
 	if !ok || strings.TrimSpace(sourceID) == "" || !isHuangguoProviderSource(source) {
 		return "", "", false
@@ -91,15 +104,16 @@ func splitProviderDramaID(id string) (source, sourceID string, ok bool) {
 
 func isHuangguoProviderSource(source string) bool {
 	switch canonicalProviderSource(source) {
-	case sourceHuangguoAI, sourceHuangguoVideo, sourceHuangdou, sourceHongguo, sourceHuangju, sourceYeguo, sourceDSD, sourceCloudFront, sourceSorani, sourceGuipian, sourceHanxiaoquan:
+	case sourceHuangguoAI, sourceHuangguoVideo, sourceHuangdou, sourceHongguo, sourceHuangju, sourceYeguo, sourceDSD, sourceCloudFront, sourceGuipian, sourceHanxiaoquan, sourceIkanbot, sourceA123:
 		return true
 	default:
-		return false
+		return isDuanjuProviderSource(source)
 	}
 }
 
 func canonicalProviderSource(source string) string {
-	switch strings.ToLower(strings.TrimSpace(source)) {
+	key := strings.ToLower(strings.TrimSpace(source))
+	switch key {
 	case "huangguo", "huangguoai", "huangguoai.com":
 		return sourceHuangguoAI
 	case "huangguo-video", "huangguo.video":
@@ -116,15 +130,19 @@ func canonicalProviderSource(source string) string {
 		return sourceDSD
 	case "cloudfront":
 		return sourceCloudFront
-	case "sorani", "sorani.net", "www.sorani.net", "api.sorani.cc", "sorani.cc":
-		return sourceSorani
 	case "guipian", "guipianwu.com", "www.guipianwu.com":
 		return sourceGuipian
 	case "hanxiaoquan", "jennyhow.com", "www.jennyhow.com":
 		return sourceHanxiaoquan
-	default:
-		return strings.TrimSpace(source)
+	case "ikanbot", "ikanbot.com", "www.ikanbot.com", "www1.ikanbot.com":
+		return sourceIkanbot
+	case "a123", "a123tv", "a123tv.com", "www.a123tv.com":
+		return sourceA123
 	}
+	if canonical, found := duanjuSourceAliases[key]; found {
+		return canonical
+	}
+	return strings.TrimSpace(source)
 }
 
 func mergeDramaMetadata(base, extra Drama) Drama {
@@ -231,18 +249,25 @@ func (d *Downloader) GetHuangguoChapters(ctx context.Context, source, sourceID s
 	case sourceDSD:
 		drama, chapters, err := d.fetchDSDDetail(ctx, sourceID)
 		return drama.DisplayTitle(), chapters, err
-	case sourceSorani:
-		drama, chapters, err := d.fetchSoraniDetail(ctx, sourceID)
-		return drama.DisplayTitle(), chapters, err
+	case sourceCloudFront:
+		return d.fetchLegacyChapters(ctx, sourceID)
 	case sourceGuipian:
 		drama, chapters, err := d.fetchGuipianDetail(ctx, sourceID)
 		return drama.DisplayTitle(), chapters, err
 	case sourceHanxiaoquan:
 		drama, chapters, err := d.fetchHanxiaoquanDetail(ctx, sourceID)
 		return drama.DisplayTitle(), chapters, err
-	case sourceCloudFront:
-		return d.fetchLegacyChapters(ctx, sourceID)
+	case sourceIkanbot:
+		drama, chapters, err := d.fetchIkanbotDetail(ctx, sourceID)
+		return drama.DisplayTitle(), chapters, err
+	case sourceA123:
+		drama, chapters, err := d.fetchA123Detail(ctx, sourceID)
+		return drama.DisplayTitle(), chapters, err
 	default:
+		if isDuanjuProviderSource(source) {
+			drama, chapters, err := d.fetchDuanjuDetail(ctx, source, sourceID)
+			return drama.DisplayTitle(), chapters, err
+		}
 		return "", nil, fmt.Errorf("unsupported provider source: %s", source)
 	}
 }
@@ -1227,14 +1252,6 @@ func mapStringSlice(m map[string]any, keys ...string) []string {
 			}
 		case []any:
 			for _, item := range x {
-				if row, ok := item.(map[string]any); ok {
-					// 上游 tags/categoryTags 可能是对象数组（如 [{name:"奇幻",custom:true}]），
-					// 直接 fmt.Sprint 会打印成 "map[custom:true name:奇幻]" 这种 Go 内部格式。
-					if name := mapString(row, "name", "title", "label", "tag"); name != "" {
-						add(name)
-					}
-					continue
-				}
 				add(fmt.Sprint(item))
 			}
 		}

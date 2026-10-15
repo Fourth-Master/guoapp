@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'core_bridge.dart';
 import 'download_preferences.dart';
 import 'local_store.dart';
+import 'remote_widgets.dart';
 import 'resource_settings.dart';
 import 'widgets.dart';
 
@@ -50,7 +51,7 @@ class DownloadPreferencesScreen extends StatelessWidget {
                         },
                 ),
                 const SizedBox(height: 12),
-                SwitchListTile(
+                SwitchListTile.adaptive(
                   value: preferences.includeVip,
                   title: const Text('默认包含 VIP 集'),
                   subtitle: const Text('VIP 集可能仅提供试看内容；下载前仍可调整选择。'),
@@ -104,6 +105,7 @@ class _ResourceSettingsScreenState extends State<ResourceSettingsScreen> {
   @override
   void initState() {
     super.initState();
+    ensureTelevisionFocus(context);
     _load();
   }
 
@@ -269,7 +271,7 @@ class _ResourceSettingsScreenState extends State<ResourceSettingsScreen> {
                   const SizedBox(height: 16),
                   _count('同时下载数量', _downloads, (value) => _downloads = value),
                   const SizedBox(height: 12),
-                  SwitchListTile(
+                  SwitchListTile.adaptive(
                     contentPadding: EdgeInsets.zero,
                     value: _folders,
                     title: const Text('按站源分类保存'),

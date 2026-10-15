@@ -39,13 +39,18 @@ func (d *Downloader) providerBaseURL(source string) string {
 		configured, fallback = d.cfg.YeguoURL, yeguoBaseURL
 	case sourceDSD:
 		configured, fallback = d.cfg.DSDURL, dsdBaseURL
-	case sourceSorani:
-		configured, fallback = d.cfg.SoraniURL, soraniSiteBaseURL
 	case sourceGuipian:
 		configured, fallback = d.cfg.GuipianURL, guipianSiteBaseURL
 	case sourceHanxiaoquan:
 		configured, fallback = d.cfg.HanxiaoquanURL, hanxiaoquanSiteBaseURL
+	case sourceIkanbot:
+		configured, fallback = d.cfg.IkanbotURL, ikanbotSiteBaseURL
+	case sourceA123:
+		configured, fallback = d.cfg.A123URL, a123SiteBaseURL
 	default:
+		if spec, found := duanjuSourceSpecFor(source); found {
+			return d.duanjuBaseURL(spec.ID)
+		}
 		fallback = "https://d2pypzndaqisk.cloudfront.net"
 	}
 	return strings.TrimRight(firstNonEmpty(configured, fallback), "/")
@@ -75,20 +80,22 @@ func providerSourceForURL(raw string) string {
 		return sourceYeguo
 	case host == "dsd.com.se" || host == "www.dsd.com.se":
 		return sourceDSD
-	case host == "sorani.net" || host == "www.sorani.net" || host == "api.sorani.cc" || host == "sorani.cc":
-		return sourceSorani
 	case host == "guipianwu.com" || host == "www.guipianwu.com":
 		return sourceGuipian
 	case host == "jennyhow.com" || host == "www.jennyhow.com":
 		return sourceHanxiaoquan
+	case host == "ikanbot.com" || host == "www.ikanbot.com" || host == "www1.ikanbot.com":
+		return sourceIkanbot
+	case host == "a123tv.com" || host == "www.a123tv.com":
+		return sourceA123
 	default:
-		return ""
+		return duanjuSourceForHost(host)
 	}
 }
 
 func (d *Downloader) providerURLCandidates(raw string) []string {
 	source := providerSourceForURL(raw)
-	if source == "" || source == sourceHuangju || source == sourceYeguo {
+	if source == "" || source == sourceHuangju || source == sourceYeguo || isDuanjuProviderSource(source) {
 		return []string{raw}
 	}
 	parsed, _ := url.Parse(raw)
@@ -133,14 +140,20 @@ func (d *Downloader) resolveProviderMedia(ctx context.Context, task Task) (provi
 	if chapter.Source == sourceDSD {
 		return d.resolveDSDMedia(ctx, task)
 	}
-	if chapter.Source == sourceSorani {
-		return d.resolveSoraniMedia(ctx, task)
-	}
 	if chapter.Source == sourceGuipian {
 		return d.resolveGuipianMedia(ctx, task)
 	}
 	if chapter.Source == sourceHanxiaoquan {
 		return d.resolveHanxiaoquanMedia(ctx, task)
+	}
+	if chapter.Source == sourceIkanbot {
+		return d.resolveIkanbotMedia(ctx, task)
+	}
+	if chapter.Source == sourceA123 {
+		return d.resolveA123Media(ctx, task)
+	}
+	if isDuanjuProviderSource(chapter.Source) {
+		return d.resolveDuanjuMedia(ctx, task)
 	}
 	if strings.HasPrefix(chapter.VideoURL, "hongguo-cenc://") {
 		return d.resolveHongguoMedia(ctx, task)

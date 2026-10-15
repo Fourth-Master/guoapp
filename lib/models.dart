@@ -2,19 +2,74 @@ import 'dart:convert';
 
 import 'app_build.dart';
 
+/// 用户自定义的 MacCMS / XBPQ 站源记录。
+class CustomSourceSite {
+  const CustomSourceSite({
+    required this.id,
+    required this.name,
+    required this.base,
+    this.rule = '',
+  });
+  final String id;
+  final String name;
+  final String base;
+  final String rule;
+
+  factory CustomSourceSite.fromJson(Map<String, dynamic> json) =>
+      CustomSourceSite(
+        id: json['id'] as String? ?? '',
+        name: json['name'] as String? ?? '',
+        base: json['base'] as String? ?? '',
+        rule: json['rule'] as String? ?? '',
+      );
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'name': name,
+    'base': base,
+    if (rule.isNotEmpty) 'rule': rule,
+  };
+  bool get isCustom => SourceSite.isCustomId(id);
+  bool get hasRule => rule.trim().isNotEmpty;
+  SourceSite get asSourceSite => SourceSite(id, name, base);
+}
+
 class SourceSite {
   const SourceSite(this.id, this.name, this.description);
   final String id;
   final String name;
   final String description;
-  bool get onlineSearch => id == 'hongguo' || pagedSearch;
+  bool get onlineSearch => id == 'hongguo' || pagedSearch || duanjuOnlineSearch;
+  bool get duanjuOnlineSearch => const {
+    'yaguo',
+    'maoguo',
+    'fanguo',
+    'guanguo',
+    'heguo',
+    'xingguo',
+    'huaguo',
+    'niuguo',
+    'wangguo',
+    'faguo',
+    'wuguo',
+  }.contains(id);
   bool get pagedSearch =>
       id == 'huangju' ||
       id == 'yeguo' ||
       id == 'dsd' ||
-      id == 'sorani' ||
       id == 'guipian' ||
-      id == 'hanxiaoquan';
+      id == 'hanxiaoquan' ||
+      id == 'ikanbot' ||
+      id == 'a123' ||
+      duanjuPaged;
+  bool get duanjuPaged => const {
+    'yaguo',
+    'guanguo',
+    'huaguo',
+    'niuguo',
+    'wangguo',
+    'faguo',
+    'wuguo',
+  }.contains(id);
   bool get searchSuggestions => id == 'hongguo';
   String get groupId => switch (id) {
     'huangguo-video' || 'huangguoai' || 'cloudfront' => 'huangguo',
@@ -30,19 +85,41 @@ class SourceSite {
 
   static const hongguo = SourceSite('hongguo', '红果', '短剧 · 漫剧 · AI 剧');
   static const dsd = SourceSite('dsd', '帝果', '分类视频 · 在线搜索');
-  static const sorani = SourceSite('sorani', '青空', '番剧 · 剧场动画 · 特摄');
   static const guipian = SourceSite('guipian', '鬼片', '鬼片 · 电视剧 · 动漫');
+  static const ikanbot = SourceSite(
+    'ikanbot',
+    '爱看机器人',
+    '电影 · 剧集 · 多线路搜索',
+  );
+  static const a123 = SourceSite(
+    'a123',
+    'A123',
+    '电影 · 连续剧 · 综艺 · 动漫 · 多线路',
+  );
   static const hanxiaoquan = SourceSite(
     'hanxiaoquan',
     '韩小圈',
     '韩剧 · 韩国电影 · 综艺动漫',
   );
-
-  /// 默认可见的站源：红果、韩小圈、鬼片网、青空次元。
-  static const primaryValues = [hongguo, hanxiaoquan, guipian, sorani];
-
-  /// 敏感站源：默认隐藏，输入解锁密码后才显示。
-  static const restrictedValues = [
+  static const duanjuValues = [
+    SourceSite('yaguo', '芽果', '星芽短剧 · 登录接口'),
+    SourceSite('maoguo', '猫果', '七猫短剧 · 签名接口'),
+    SourceSite('fanguo', '饭果', '西饭短剧 · 搜索接口'),
+    SourceSite('guanguo', '观果', '围观短剧 · 分类接口'),
+    SourceSite('heguo', '河果', '河马剧场 · 网页接口'),
+    SourceSite('xingguo', '星果', '星星短剧 · 连载接口'),
+    SourceSite('huaguo', '花果', '花生短剧 · 网页目录'),
+    SourceSite('niuguo', '牛果', '牛牛短剧 · 分类接口'),
+    SourceSite('wangguo', '网果', '短剧网站 · 网页目录'),
+    SourceSite('faguo', '发果', '168 短剧 · 网页目录'),
+    SourceSite('wuguo', '伍果', '五五短剧 · 网页目录'),
+  ];
+  static const knownValues = [
+    hongguo,
+    ikanbot,
+    a123,
+    hanxiaoquan,
+    guipian,
     SourceSite('huangdou', '黄豆', '精选短剧'),
     SourceSite('huangju', '剧果', '热门 · 最新 · 分类短剧'),
     SourceSite('yeguo', '野果', '分类短剧 · 在线搜索'),
@@ -50,24 +127,41 @@ class SourceSite {
     SourceSite('huangguo-video', '黄果视频', '视频剧集'),
     SourceSite('huangguoai', '黄果 AI', 'AI 短剧'),
     SourceSite('cloudfront', '黄果旧版', '旧 API 剧库'),
+    ...duanjuValues,
   ];
-  static const knownValues = [...primaryValues, ...restrictedValues];
-  static const allValues = [...primaryValues, ...restrictedValues];
+  static const allValues = [
+    hongguo,
+    ikanbot,
+    a123,
+    hanxiaoquan,
+    guipian,
+    SourceSite('huangdou', '黄豆', '精选短剧'),
+    SourceSite('huangju', '剧果', '热门 · 最新 · 分类短剧'),
+    SourceSite('yeguo', '野果', '分类短剧 · 在线搜索'),
+    dsd,
+    SourceSite('huangguo-video', '黄果视频', '视频剧集'),
+    SourceSite('huangguoai', '黄果 AI', 'AI 短剧'),
+    SourceSite('cloudfront', '黄果旧版', '旧 API 剧库'),
+    ...duanjuValues,
+  ];
   static const values = allSourcesEnabled ? knownValues : [hongguo];
-  static bool isAvailable(String id) => values.any((site) => site.id == id);
-  static bool isKnown(String id) => allValues.any((site) => site.id == id);
-  static bool isPrimary(String id) =>
-      primaryValues.any((site) => site.id == id);
-  static bool isRestricted(String id) =>
-      restrictedValues.any((site) => site.id == id);
-
-  /// 运行时可见站源：未解锁时只保留 [primaryValues]。
-  static List<SourceSite> visibleValues({required bool unlocked}) => [
-    for (final site in values)
-      if (unlocked || isPrimary(site.id)) site,
-  ];
-  static SourceSite byId(String id) =>
-      allValues.firstWhere((site) => site.id == id, orElse: () => hongguo);
+  /// 当前会话已注册的自定义源 ID，供可用性判断与站源归一化使用。
+  static final Set<String> customIds = {};
+  static bool isCustomId(String id) => id.startsWith('custom:');
+  static bool isAvailable(String id) =>
+      values.any((site) => site.id == id) || customIds.contains(id);
+  static bool isKnown(String id) =>
+      allValues.any((site) => site.id == id) || customIds.contains(id);
+  static SourceSite byId(String id) {
+    if (customIds.contains(id)) {
+      return SourceSite(id, customName(id), '自定义站源');
+    }
+    return allValues.firstWhere((site) => site.id == id, orElse: () => hongguo);
+  }
+  static String customName(String id) {
+    if (id.startsWith('custom:')) return '自定义源';
+    return id;
+  }
 }
 
 class SourceGroup {

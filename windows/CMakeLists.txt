@@ -4,7 +4,7 @@ project(duanju_app LANGUAGES CXX)
 
 # The name of the executable created for the application. Change this to change
 # the on-disk name of your application.
-set(BINARY_NAME "zhenguojian")
+set(BINARY_NAME "duanjushijie")
 
 # Explicitly opt in to modern CMake behaviors to avoid warnings with recent
 # versions of CMake.
@@ -110,10 +110,6 @@ install(FILES "${AOT_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_DATA_DIR}"
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/runner/duanju_core.dll"
   DESTINATION "${INSTALL_BUNDLE_LIB_DIR}" COMPONENT Runtime)
 
-set(CMAKE_INSTALL_SYSTEM_RUNTIME_DESTINATION ".")
+set(CMAKE_INSTALL_SYSTEM_RUNTIME_DESTINATION "${INSTALL_BUNDLE_LIB_DIR}")
 set(CMAKE_INSTALL_SYSTEM_RUNTIME_COMPONENT Runtime)
-# 新版 CMake 无法解析以生成表达式开头的相对安装目标，改为显式指定安装目录。
-set(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS_SKIP TRUE)
 include(InstallRequiredSystemLibraries)
-install(FILES ${CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS}
-  DESTINATION "${INSTALL_BUNDLE_LIB_DIR}" COMPONENT Runtime)
