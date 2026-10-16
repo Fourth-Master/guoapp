@@ -554,10 +554,21 @@ class _HomeScreenState extends State<HomeScreen> {
       accept(result);
     } catch (error) {
       if (!mounted || generation != _generation) return;
+      final message = error.toString();
+      // 境外站源（黄果、帝果等）在无代理网络下必然连接失败，
+      // 把原因写进错误面板，避免用户误以为 App 卡死。
+      final hint = message.contains('客户端常见网络错误') ||
+              message.contains('连接') ||
+              message.contains('超时') ||
+              message.contains('timeout') ||
+              message.contains('unreachable') ||
+              message.contains('不可用')
+          ? '\n\n黄果、帝果为境外站源，手机未配置代理或 VPN 时无法连接；开启全局代理后重试即可，其余站源不受影响。'
+          : '';
       setState(() {
         _loading = false;
         _loadingMore = false;
-        _error = error.toString();
+        _error = '$message$hint';
       });
     }
   }
