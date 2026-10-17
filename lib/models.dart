@@ -2,6 +2,31 @@ import 'dart:convert';
 
 import 'app_build.dart';
 
+/// 站源的发布页采集配置：从发布页按规则提取最新可用域名。
+class PublishSourceConfig {
+  const PublishSourceConfig({
+    required this.source,
+    required this.url,
+    this.rule = '',
+    this.current = '',
+    this.updatedAt,
+  });
+  final String source;
+  final String url;
+  final String rule;
+  final String current;
+  final DateTime? updatedAt;
+
+  factory PublishSourceConfig.fromJson(Map<String, dynamic> json) =>
+      PublishSourceConfig(
+        source: json['source'] as String? ?? '',
+        url: json['url'] as String? ?? '',
+        rule: json['rule'] as String? ?? '',
+        current: json['current'] as String? ?? '',
+        updatedAt: DateTime.tryParse(json['updatedAt'] as String? ?? ''),
+      );
+}
+
 /// 用户自定义的 MacCMS / XBPQ 站源记录。
 class CustomSourceSite {
   const CustomSourceSite({

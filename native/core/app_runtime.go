@@ -184,6 +184,7 @@ type nativeEngine struct {
 	sourceCatalogMu  sync.Mutex
 	sourceCatalogs   map[string]chan struct{}
 	customRegistry   *customMaccmsRegistry
+	publishRegistry  *publishRegistry
 }
 
 var nativeState struct {
@@ -294,6 +295,10 @@ func newNativeEngine(directory string) (*nativeEngine, error) {
 	// loadSourceRecords 里的 isHuangguoProviderSource 要能认出 custom:<hash> 记录才不会丢任务状态。
 	engine.customRegistry = newCustomMaccmsRegistry(directory)
 	engine.customRegistry.load()
+	// 发布页域名采集：注册表加载后启动后台自动刷新（引擎被替换时循环自行退出）。
+	engine.publishRegistry = newPublishRegistry(directory)
+	engine.publishRegistry.load()
+	go engine.publishAutoRefreshLoop(context.Background())
 	engine.loadSourceRecords()
 	engine.covers = newNativeCoverCache(directory, d)
 	engine.downloads = newNativeDownloads(engine)
@@ -511,6 +516,35 @@ func nativeDispatch(input nativeInput) (any, error) {
 			return nil, err
 		}
 		return map[string]any{"removed": removed}, nil
+	case "publishSources":
+		return map[string]any{"items": engine.publishRegistry.snapshot()}, nil
+	case "savePublishSource":
+		if engine.publishRegistry == nil {
+			return nil, errors.New("本地核心尚未就绪")
+		}
+		if err := engine.publishRegistry.set(input.Source, publishConfig{URL: input.Base, Rule: input.Rule}); err != nil {
+			return nil, err
+		}
+		// 保存后立即采集验证一次，把结果带回给用户。
+		base, err := engine.downloader.publishRefresh(ctx, input.Source)
+		if err != nil {
+			return map[string]any{"saved": true, "refreshed": false, "warning": publicError(err).Error()}, nil
+		}
+		return map[string]any{"saved": true, "refreshed": true, "base": base}, nil
+	case "removePublishSource":
+		if engine.publishRegistry == nil {
+			return nil, errors.New("本地核心尚未就绪")
+		}
+		return true, engine.publishRegistry.remove(input.Source)
+	case "refreshPublishSource":
+		if engine.publishRegistry == nil {
+			return nil, errors.New("本地核心尚未就绪")
+		}
+		base, err := engine.downloader.publishRefresh(ctx, input.Source)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"base": base}, nil
 	case "cover":
 		return engine.loadCover(ctx, input.Drama, input.Force)
 	case "prepareCover":

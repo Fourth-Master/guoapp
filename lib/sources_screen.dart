@@ -7,6 +7,7 @@ import 'core_bridge.dart';
 import 'custom_sources_screen.dart';
 import 'local_store.dart';
 import 'models.dart';
+import 'publish_sources_screen.dart';
 import 'remote_widgets.dart';
 import 'source_status.dart';
 import 'widgets.dart';
@@ -224,6 +225,28 @@ class _SourcesScreenState extends State<SourcesScreen> {
                         context,
                         MaterialPageRoute<void>(
                           builder: (_) => CustomSourcesScreen(
+                            repository: widget.repository,
+                            store: widget.store,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                  Card(
+                    key: const ValueKey('publish-sources-entry'),
+                    margin: const EdgeInsets.only(bottom: 16),
+                    clipBehavior: Clip.antiAlias,
+                    child: ListTile(
+                      leading: const Icon(Icons.public_rounded),
+                      title: const Text('发布页域名采集'),
+                      subtitle: const Text(
+                        '配置站源发布页地址与域名规则，域名失效后自动采集最新可用域名',
+                      ),
+                      trailing: const Icon(Icons.chevron_right_rounded),
+                      onTap: () => Navigator.push<void>(
+                        context,
+                        MaterialPageRoute<void>(
+                          builder: (_) => PublishSourcesScreen(
                             repository: widget.repository,
                             store: widget.store,
                           ),

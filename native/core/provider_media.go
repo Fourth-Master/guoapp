@@ -23,6 +23,10 @@ type providerMedia struct {
 
 func (d *Downloader) providerBaseURL(source string) string {
 	source = canonicalProviderSource(source)
+	// 发布页采集到的新域名优先于配置与内置地址，域名失效后无需改代码即可恢复。
+	if base := publishResolvedBase(source); base != "" {
+		return base
+	}
 	var configured, fallback string
 	switch source {
 	case sourceHuangguoAI:

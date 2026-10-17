@@ -157,6 +157,19 @@ abstract class AppRepository {
   /// 恢复默认：删除全部自定义源，仅保留内置源。返回删除数量。
   Future<int> resetCustomSources() async =>
       throw AppFailure('当前环境不支持自定义源');
+  /// 已配置发布页采集的站源列表（含当前采集到的域名）。
+  Future<List<PublishSourceConfig>> publishSources() async => const [];
+  /// 保存站源的发布页配置并立即采集验证；采集失败时返回 warning，配置仍然生效。
+  Future<Map<String, dynamic>> savePublishSource(
+    String source, {
+    required String url,
+    String rule = '',
+  }) async => throw AppFailure('当前环境不支持发布页采集');
+  Future<void> removePublishSource(String source) async =>
+      throw AppFailure('当前环境不支持发布页采集');
+  /// 立即重新采集，返回可用域名；失败抛错。
+  Future<String> refreshPublishSource(String source) async =>
+      throw AppFailure('当前环境不支持发布页采集');
   Future<List<String>> suggestions(String query) async => const [];
   Future<Map<String, dynamic>> storage() async => {};
   Future<String> downloadDirectory() async =>
@@ -558,6 +571,46 @@ class NativeRepository extends AppRepository {
     _adminPermission();
     final result = await _call({'action': 'resetCustomSources'});
     return (result as Map)['removed'] as int? ?? 0;
+  }
+
+  @override
+  Future<List<PublishSourceConfig>> publishSources() async {
+    final result = await _call({'action': 'publishSources'});
+    return [
+      for (final row in result['items'] as List? ?? const [])
+        PublishSourceConfig.fromJson(Map<String, dynamic>.from(row as Map)),
+    ];
+  }
+
+  @override
+  Future<Map<String, dynamic>> savePublishSource(
+    String source, {
+    required String url,
+    String rule = '',
+  }) async {
+    _adminPermission();
+    final result = await _call({
+      'action': 'savePublishSource',
+      'source': source,
+      'base': url,
+      'rule': rule,
+    });
+    return Map<String, dynamic>.from(result as Map);
+  }
+
+  @override
+  Future<void> removePublishSource(String source) async {
+    _adminPermission();
+    await _call({'action': 'removePublishSource', 'source': source});
+  }
+
+  @override
+  Future<String> refreshPublishSource(String source) async {
+    final result = await _call({
+      'action': 'refreshPublishSource',
+      'source': source,
+    });
+    return (result as Map)['base'] as String? ?? '';
   }
 
   void _authorize(String source, {bool download = false}) {
