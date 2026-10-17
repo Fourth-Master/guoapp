@@ -35,6 +35,11 @@ jobs:
           channel: stable
           cache: true
       - run: python3 scripts/build_ios.py ${{ matrix.arguments }}
+      - name: 构建失败时输出 Xcode 详细错误
+        if: failure()
+        run: |
+          flutter pub get
+          flutter build ios --release --no-codesign --verbose --dart-define=ALL_SOURCES=true 2>&1 | tail -80
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.edition }}-ios-unsigned
